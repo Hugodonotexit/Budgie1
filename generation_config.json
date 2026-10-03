@@ -1,0 +1,9 @@
+{
+  "bos_token_id": 1,
+  "eos_token_id": [
+    2,
+    6
+  ],
+  "pad_token_id": 0,
+  "use_cache": true
+}

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "budgie"
+version = "0.1.0"
+description = "Budgie: a decoder-only transformer with local, dilated and global attention, in Hugging Face format"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=5.15",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+# CUDA kernel for the depthwise causal convs; without it the model uses an equivalent PyTorch path.
+fast = ["causal-conv1d>=1.6"]
+dev = ["pytest"]
+
+# The repository root *is* the model directory (flat modules, so that trust_remote_code can copy
+# them next to a checkpoint), and `pip install` exposes it as the package `budgie`.
+[tool.setuptools]
+packages = ["budgie"]
+package-dir = { budgie = "." }
+
+[tool.setuptools.package-data]
+budgie = ["config.json", "generation_config.json", "tokenizer/*"]

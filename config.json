@@ -1,0 +1,110 @@
+{
+  "adaptive_cutoffs": [
+    2048,
+    8192
+  ],
+  "adaptive_div": 2,
+  "attention_sinks": true,
+  "attention_types": {
+    "D4": {
+      "conv": 4,
+      "dilation": 4,
+      "kv_heads": 4,
+      "rope": true,
+      "window": 2048
+    },
+    "D8": {
+      "conv": 4,
+      "dilation": 4,
+      "kv_heads": 4,
+      "rope": true,
+      "window": 4096
+    },
+    "G": {
+      "conv": 4,
+      "dilation": 1,
+      "kv_heads": 8,
+      "rope": false,
+      "window": null
+    },
+    "S": {
+      "conv": 3,
+      "dilation": 1,
+      "kv_heads": 8,
+      "rope": true,
+      "window": 2048
+    }
+  },
+  "auto_map": {
+    "AutoConfig": "configuration_budgie.BudgieConfig",
+    "AutoModel": "modeling_budgie.BudgieModel",
+    "AutoModelForCausalLM": "modeling_budgie.BudgieForCausalLM"
+  },
+  "block_pattern": [
+    "S",
+    "D4",
+    "S",
+    "D8",
+    "S",
+    "G"
+  ],
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "ffn_conv_kernel": 4,
+  "ffn_hidden_layers": 3,
+  "fp32_residual": true,
+  "head_dim": 128,
+  "hidden_size": 1024,
+  "initializer_range": 0.025,
+  "intermediate_size": [
+    2048,
+    2048,
+    2048
+  ],
+  "kv_share": {
+    "7": 1,
+    "9": 3,
+    "11": 5,
+    "19": 13,
+    "21": 15,
+    "23": 17,
+    "31": 25,
+    "33": 27,
+    "35": 29,
+    "43": 37,
+    "45": 39,
+    "47": 41
+  },
+  "lin_chunk": 128,
+  "lin_conv_kernel": 4,
+  "lin_gate_init": 0.05,
+  "lin_half_life_range": [
+    256.0,
+    32768.0
+  ],
+  "lin_head_dim": 64,
+  "lin_head_gate": true,
+  "lin_heads": 4,
+  "linear_branch": "before_G",
+  "logit_softcap": 50.0,
+  "max_position_embeddings": 65536,
+  "model_type": "budgie",
+  "ngram_buckets": 262144,
+  "ngram_dim": 128,
+  "ngram_heads": 2,
+  "ngram_orders": [
+    2,
+    3
+  ],
+  "num_attention_heads": 16,
+  "num_blocks": 8,
+  "num_hidden_layers": 48,
+  "pad_token_id": 0,
+  "qk_norm": true,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.15.0",
+  "use_cache": true,
+  "vocab_size": 42000
+}

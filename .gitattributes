@@ -1,0 +1,4 @@
+# in case weights are ever committed (e.g. when this repo is pushed to the Hugging Face Hub)
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.gguf filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+
+# weights and trainer state belong on the Hub / in release assets, not in git
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+checkpoint-*/

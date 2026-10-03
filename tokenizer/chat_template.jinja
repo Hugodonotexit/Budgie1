@@ -1,0 +1,46 @@
+{{- bos_token -}}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}
+{%- endfor -%}
+{%- if tools -%}
+{{- '<|system|>\n' -}}
+{%- if messages and messages[0]['role'] == 'system' -%}{{- messages[0]['content'] + '\n\n' -}}{%- endif -%}
+{{- '# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>' -}}
+{%- for tool in tools -%}{{- '\n' + (tool | tojson) -}}{%- endfor -%}
+{{- '\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call><|end|>\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- set role = message['role'] -%}
+{%- if role == 'system' -%}
+{%- if not (loop.first and tools) -%}{{- '<|system|>\n' + message['content'] + '<|end|>\n' -}}{%- endif -%}
+{%- elif role == 'user' -%}
+{{- '<|user|>\n' + message['content'] + '<|end|>\n' -}}
+{%- elif role == 'assistant' -%}
+{%- set content = message['content'] or '' -%}
+{%- set reasoning = message.get('reasoning_content') or '' -%}
+{%- if not reasoning and '</think>' in content -%}
+{%- set reasoning = content.split('</think>')[0].split('<think>')[-1].strip('\n') -%}
+{%- set content = content.split('</think>')[-1].lstrip('\n') -%}
+{%- endif -%}
+{{- '<|assistant|>\n' -}}
+{%- if loop.index0 > ns.last_user and reasoning -%}{{- '<think>\n' + reasoning.strip('\n') + '\n</think>\n\n' -}}{%- endif -%}
+{{- content.lstrip('\n') -}}
+{%- for tool_call in message.get('tool_calls') or [] -%}
+{%- set fn = tool_call['function'] if tool_call['function'] is defined else tool_call -%}
+{%- if content or not loop.first -%}{{- '\n' -}}{%- endif -%}
+{{- '<tool_call>\n{"name": "' + fn['name'] + '", "arguments": ' -}}
+{{- fn['arguments'] if fn['arguments'] is string else (fn['arguments'] | tojson) -}}
+{{- '}\n</tool_call>' -}}
+{%- endfor -%}
+{{- '<|end|>\n' -}}
+{%- elif role == 'tool' -%}
+{%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}{{- '<|user|>' -}}{%- endif -%}
+{{- '\n<tool_response>\n' + message['content'] + '\n</tool_response>' -}}
+{%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}{{- '<|end|>\n' -}}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|assistant|>\n' -}}
+{%- if enable_thinking is defined and not enable_thinking -%}{{- '<think>\n\n</think>\n\n' -}}{%- endif -%}
+{%- endif -%}
