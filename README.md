@@ -1,4 +1,4 @@
-# Budgie
+# Budgie 1
 
 Budgie is a decoder-only language model built from **windowed, dilated and global attention layers**, with
 depthwise causal convolutions in front of every attention and feed-forward block, a deeper-than-usual FFN,
