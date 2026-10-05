@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Budgie: a decoder-only transformer with local, dilated and global attention, in Hugging Face format"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Hugodonotexit" }]
 dependencies = [
     "torch>=2.6",
     "transformers>=5.15",
@@ -15,6 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
+Source = "https://github.com/Hugodonotexit/Budgie1"
 Models = "https://huggingface.co/Hugodonotexit"
 
 [project.optional-dependencies]

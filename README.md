@@ -155,4 +155,6 @@ configuration validation, `save_pretrained` → `from_pretrained` including load
 
 ## Licence
 
-No licence has been chosen yet, so all rights are reserved until one is added.
+The code, configuration and tokenizer in this repository are released under the
+[Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). The weights of the models in the Budgie1.0-1B
+collection are published separately on Hugging Face, and each model's page states its own licence.
