@@ -7,17 +7,18 @@ from transformers import PretrainedConfig
 # its reach is window * dilation. conv: kernel of the depthwise causal convs in front of Q and K/V.
 # rope: rotary positions (False = none). kv_heads: key/value heads shared by the query heads.
 DEFAULT_ATTENTION_TYPES = {
-    "S": {"window": 2048, "dilation": 1, "conv": 3, "rope": True, "kv_heads": 8},   # local, reach 2k
-    "D4": {"window": 2048, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 8k
-    "D8": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 16k
+    "S": {"window": 4096, "dilation": 1, "conv": 3, "rope": True, "kv_heads": 8},   # local, reach 4k
+    "D4": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 16k
+    "D8": {"window": 8192, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 32k
+    "D16": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},  # dilated, reach 64k
     "G": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 8},  # global, no positions
 }
-DEFAULT_PATTERN = ("S", "D4", "S", "D8", "S", "G")
+DEFAULT_PATTERN = ("S", "D4", "S", "D8", "D16", "G")
 # One multiplier per n-gram hash head. The heads must differ in their multiplier, not just a seed:
 # a seed only shifts every hash by a constant, so n-grams that collide under one head would collide
 # under all of them.
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
-SHARED_KINDS = ("D4", "D8", "G")
+SHARED_KINDS = ("D4", "D8", "D16", "G")
 LINEAR_BRANCH_MODES = ("none", "before_G", "after_G")
 LINEAR_BRANCH_KEYS = ("lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
                       "lin_base_heads")
@@ -44,8 +45,8 @@ class BudgieConfig(PretrainedConfig):
 
     `kv_share` maps a reader layer to the earlier owner layer of the same kind whose K/V it reuses
     (the reader keeps its own Q side and FFN, and has no K/V projection, K/V conv or K/V cache).
-    The default shares between consecutive blocks: blocks 2 and 4 read from blocks 1 and 3 for the
-    D4, D8 and G layers. Pass {} to turn sharing off.
+    The default shares between consecutive blocks: blocks 2, 4, ... read from blocks 1, 3, ... for the
+    D4, D8, D16 and G layers (every kind but S). Pass {} to turn sharing off.
 
     Input: tokens embedded with a frequency-sorted adaptive embedding (clusters split at
     `adaptive_cutoffs` in frequency rank, each `adaptive_div` times narrower than the last, projected
@@ -257,7 +258,7 @@ class BudgieConfig(PretrainedConfig):
         return self.kv_share.get(i)
 
     def _default_kv_share(self):
-        """Odd-numbered blocks (2nd, 4th, ...) read the D4 / D8 / G layers of the block before them."""
+        """Odd-numbered blocks (2nd, 4th, ...) read the D4 / D8 / D16 / G layers of the block before them."""
         size, share = len(self.block_pattern), {}
         for block in range(1, self.num_blocks, 2):
             for pos, kind in enumerate(self.block_pattern):

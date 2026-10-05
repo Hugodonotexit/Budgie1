@@ -11,12 +11,13 @@ from xml.sax.saxutils import escape
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 cfg = json.loads((ROOT / "config.json").read_text())
 
-W, H = 1040, 1196
+W, H = 1040, 1224
 INK, MUTED, BG, GRID = "#0f172a", "#475569", "#ffffff", "#e2e8f0"
 KIND = {  # fill, stroke
     "S": ("#dbeafe", "#2563eb"),
     "D4": ("#dcfce7", "#16a34a"),
     "D8": ("#fef3c7", "#d97706"),
+    "D16": ("#cffafe", "#0891b2"),
     "G": ("#fce7f3", "#db2777"),
 }
 BRANCH = ("#ede9fe", "#7c3aed")
@@ -77,6 +78,8 @@ cuts, div = cfg["adaptive_cutoffs"], cfg["adaptive_div"]
 branch_on = cfg.get("linear_branch", "none") != "none"
 reach = lambda t: None if types[t]["window"] is None else types[t]["window"] * types[t]["dilation"]
 shared = sorted({int(r) // len(pattern) + 1 for r in cfg["kv_share"]})
+reader_kinds = {pattern[int(r) % len(pattern)] for r in cfg["kv_share"]}   # kinds whose layers read another layer's K/V
+kinds = list(dict.fromkeys(pattern))                                       # distinct kinds, in order of first use
 
 out.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="{FONT}">')
 out.append('<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
@@ -117,14 +120,15 @@ for i, kind in enumerate(pattern):
     if i:
         arrow(LX + LW / 2, row_y[i - 1] + RH, LX + LW / 2, y)
     tag = ("reach " + k(reach(kind))) if reach(kind) else "reach: all"
-    text(LX + LW + 8, y + RH / 2 + 4, tag + (" · KV*" if kind in ("D4", "D8", "G") and shared else ""), 11, "normal", "start", MUTED)
+    text(LX + LW + 8, y + RH / 2 + 4, tag + (" · KV*" if kind in reader_kinds else ""), 11, "normal", "start", MUTED)
 g_first = pattern.index("G")
 if branch_on:
     lh, lw = cfg["lin_heads"], cfg["lin_head_dim"]
-    ly0, ly1 = row_y[0] + 4, row_y[g_first] - 12
-    box(BX + 8, row_y[1], 100, row_y[3] + RH - row_y[1], ["Retention", "branch", f"{lh} heads × {lw}", "fixed decay", "reset per doc"], BRANCH, 11.5)
+    last_local = g_first - 1   # the branch sits beside every layer between the block start and the G layer
+    branch_bottom = row_y[last_local] + RH // 2   # stops short of the G layer so the output arrow has room to turn
+    box(BX + 8, row_y[1], 100, branch_bottom - row_y[1], ["Retention", "branch", f"{lh} heads × {lw}", "fixed decay", "reset per doc"], BRANCH, 11.5)
     path(f"M{BX+58} {BY+30}V{row_y[1]}", BRANCH[1])
-    path(f"M{BX+58} {row_y[3]+RH}V{row_y[g_first]-8}H{LX-13}", BRANCH[1])
+    path(f"M{BX+58} {branch_bottom}V{row_y[g_first]-8}H{LX-13}", BRANCH[1])
     plus(LX - 24, row_y[g_first] - 8)
     text(BX + 8, row_y[g_first] + 18, "gated output", 11, "normal", "start", BRANCH[1])
 ft = by_end + 12
@@ -212,18 +216,19 @@ right_end = ffn_end + 86
 
 # ---- bottom: attention patterns ----------------------------------------------------------------
 PY = max(left_end, right_end) + 34
-rect(24, PY, W - 48, 4 * 34 + 74, ("#fafafa", "#cbd5e1"), 12)
+rect(24, PY, W - 48, len(kinds) * 34 + 74, ("#fafafa", "#cbd5e1"), 12)
 text(40, PY + 26, "What the newest token can attend to", 14, "bold", "start")
-text(W - 40, PY + 26, "schematic, not to scale: windows are shrunk 256×, the stride is kept", 11.5, "normal", "end", MUTED)
 N, CW, CG = 64, 8, 1
 X0 = 110
-for i, kind in enumerate(pattern[:0] or ["S", "D4", "D8", "G"]):
-    if kind not in types:
-        continue
+shrink = 1                      # windows are scaled down until the longest reach fits in N cells; the stride is kept
+while max((reach(x) or 0) for x in kinds) / shrink > N:
+    shrink *= 2
+text(W - 40, PY + 26, f"schematic, not to scale: windows are shrunk {shrink}×, the stride is kept", 11.5, "normal", "end", MUTED)
+for i, kind in enumerate(kinds):
     t = types[kind]
     y = PY + 46 + i * 34
     text(60, y + 14, kind, 14, "bold", "middle", KIND[kind][1])
-    win = None if t["window"] is None else max(2, t["window"] // 256)
+    win = None if t["window"] is None else max(2, t["window"] // shrink)
     seen = set()
     for step in range(N):
         pos = N - 1 - step * t["dilation"]
@@ -236,12 +241,12 @@ for i, kind in enumerate(pattern[:0] or ["S", "D4", "D8", "G"]):
     r = reach(kind)
     label = (f"window {k(t['window'])}" + (f", stride {t['dilation']}, reach {k(r)}" if t["dilation"] > 1 else f", reach {k(r)}")) if t["window"] else "every earlier token"
     text(X0 + N * (CW + CG) + 18, y + 16, label, 12.5, "normal", "start", INK)
-text(X0, PY + 46 + 4 * 34 + 8, "older tokens", 11.5, "normal", "start", MUTED)
-text(X0 + N * (CW + CG), PY + 46 + 4 * 34 + 8, "newest token", 11.5, "normal", "end", MUTED)
+text(X0, PY + 46 + len(kinds) * 34 + 8, "older tokens", 11.5, "normal", "start", MUTED)
+text(X0 + N * (CW + CG), PY + 46 + len(kinds) * 34 + 8, "newest token", 11.5, "normal", "end", MUTED)
 
-assert PY + 4 * 34 + 74 <= H, (PY + 4 * 34 + 74, H)
+assert PY + len(kinds) * 34 + 74 <= H, (PY + len(kinds) * 34 + 74, H)
 out.append("</svg>")
 (ROOT / "docs" / "structure.svg").write_text("\n".join(out) + "\n")
-print("wrote docs/structure.svg;", "layout needs", PY + 4 * 34 + 74, "of", H, "px high")
+print("wrote docs/structure.svg;", "layout needs", PY + len(kinds) * 34 + 74, "of", H, "px high")
 for p in problems:
     print("WARNING:", p)

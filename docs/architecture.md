@@ -10,14 +10,15 @@ after changing the defaults.
 
 ## Layout of the stack
 
-A **block** is a sequence of layer kinds, `block_pattern = (S, D4, S, D8, S, G)`, and the model is
+A **block** is a sequence of layer kinds, `block_pattern = (S, D4, S, D8, D16, G)`, and the model is
 `num_blocks` blocks (8 → 48 layers; `num_hidden_layers` is derived and cannot be set).
 
 | Kind | Window | Dilation | Reach | Rotary | KV heads | Conv kernel |
 |---|---|---|---|---|---|---|
-| `S` local | 2048 | 1 | 2k | yes | 8 | 3 |
-| `D4` dilated | 2048 | 4 | 8k | yes | 4 | 4 |
-| `D8` dilated | 4096 | 4 | 16k | yes | 4 | 4 |
+| `S` local | 4096 | 1 | 4k | yes | 8 | 3 |
+| `D4` dilated | 4096 | 4 | 16k | yes | 4 | 4 |
+| `D8` dilated | 8192 | 4 | 32k | yes | 4 | 4 |
+| `D16` dilated | 16384 | 4 | 64k | yes | 8 | 4 |
 | `G` global | all | 1 | all | no | 8 | 4 |
 
 A query at position *i* in a dilated layer sees *i, i−d, i−2d, …* (*window* tokens). Dilation is implemented
@@ -48,7 +49,8 @@ with the residual stream kept in fp32 (`fp32_residual`) and a final RMSNorm befo
   (`enable_gqa` falls back to the slow math kernel on some GPUs).
 * **KV sharing** (`kv_share`): a map from a *reader* layer to an earlier *owner* layer of the same kind. A reader
   keeps its own Q projection, output projection and FFN, and has no K/V projection, K/V convolution, K/V norm or
-  cache. The default makes every second block read the previous block's `D4`, `D8` and `G` K/V. `{}` turns it off.
+  cache. The default makes every second block read the previous block's `D4`, `D8`, `D16` and `G` K/V (every kind
+  except `S`). `{}` turns it off.
 
 ## Feed-forward
 
@@ -112,7 +114,7 @@ accepted.
 |---|---|---|
 | `vocab_size` | 42000 | must match the tokenizer |
 | `hidden_size` | 1024 | *d* |
-| `block_pattern` | `S D4 S D8 S G` | layer kinds of one block |
+| `block_pattern` | `S D4 S D8 D16 G` | layer kinds of one block |
 | `num_blocks` | 8 | blocks in the stack |
 | `attention_types` | see above | per kind: `window`, `dilation`, `conv`, `rope`, `kv_heads` |
 | `num_attention_heads`, `head_dim` | 16, 128 | `kv_heads` of every kind must divide the head count |

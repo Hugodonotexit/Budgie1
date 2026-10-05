@@ -11,7 +11,7 @@ weights, training code or data. Trained models are published on Hugging Face, in
 exist yet; its link will be added here when it does.
 
 The default configuration (`BudgieConfig()`) is 48 layers, hidden size 1024, 16 heads of 128 dims,
-**0.99 B parameters** (0.955 B with the retention branch off), vocabulary 42,000.
+**0.98 B parameters** (0.947 B with the retention branch off), vocabulary 42,000.
 
 ![Budgie structure: the layer stack, one decoder layer, and the attention patterns](docs/structure.svg)
 
@@ -114,13 +114,13 @@ trained on the thinking and tool tokens yet.
 
 ## Architecture in short
 
-* **Layers.** A block is `S D4 S D8 S G`, repeated `num_blocks` times (8 by default → 48 layers). `S` is local
-  attention (window 2048), `D4` and `D8` are dilated (stride 4: windows of 2048 and 4096 tokens reaching 8k and
-  16k back), `G` is global attention without positional encoding. Every layer is `x += attn(norm(x))` then
-  `x += ffn(norm(x))`.
+* **Layers.** A block is `S D4 S D8 D16 G`, repeated `num_blocks` times (8 by default → 48 layers). `S` is local
+  attention (window 4096), `D4`, `D8` and `D16` are dilated (stride 4: windows of 4096, 8192 and 16384 tokens,
+  reaching 16k, 32k and 64k back), `G` is global attention without positional encoding. Every layer is
+  `x += attn(norm(x))` then `x += ffn(norm(x))`.
 * **Attention.** Grouped-query, with a depthwise causal convolution on Q and another on K/V, QK-norm, rotary
   positions (not in `G`), and a learned sink logit per head. Every second block (2nd, 4th, …) reuses the K/V of the block
-  before them in their `D4`, `D8` and `G` layers (`kv_share`), which cuts the KV cache.
+  before them in their `D4`, `D8`, `D16` and `G` layers (`kv_share`), which cuts the KV cache.
 * **FFN.** A causal convolution, then four matrices `d → 2048 → 2048 → 2048 → d`; SiLU after the first and last hidden
   layer and a centred dSiLU after the middle one.
 * **Embeddings.** A frequency-sorted adaptive embedding (clusters of width d, d/2, d/4) plus hashed 2- and 3-gram

@@ -24,6 +24,18 @@ def test_config_json_loads_and_points_at_files_in_this_repo():
         assert (ROOT / (target.split(".")[0] + ".py")).exists(), target
 
 
+def test_default_layer_structure():
+    cfg = BudgieConfig()
+    assert cfg.block_pattern == ["S", "D4", "S", "D8", "D16", "G"] and cfg.num_hidden_layers == 48
+    assert cfg.attention_types["S"]["window"] == 4096 and cfg.attention_types["D4"]["window"] == 4096
+    assert cfg.attention_types["D8"] == {"window": 8192, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4}
+    assert cfg.attention_types["D16"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8}
+    kinds = cfg.layer_kinds
+    readers = {i for i in cfg.kv_share}
+    assert all(kinds[i] != "S" for i in readers) and {kinds[i] for i in readers} == {"D4", "D8", "D16", "G"}
+    assert json.loads((ROOT / "config.json").read_text())["block_pattern"] == cfg.block_pattern, "config.json is stale: regenerate it"
+
+
 def test_generation_config_stops_on_eos_and_end_of_turn(tok):
     gen = GenerationConfig.from_pretrained(ROOT)
     assert gen.eos_token_id == [tok.eos_token_id, tok.convert_tokens_to_ids("<|end|>")]

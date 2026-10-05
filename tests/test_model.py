@@ -16,6 +16,7 @@ TYPES = {
     "S": {"window": 6, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 2},
     "D4": {"window": 4, "dilation": 3, "conv": 3, "rope": True, "kv_heads": 2},
     "D8": {"window": 5, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
+    "D16": {"window": 7, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
     "G": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4},
 }
 BRANCH = dict(linear_branch="before_G", lin_heads=2, lin_head_dim=8, lin_conv_kernel=4, lin_chunk=8,
@@ -128,7 +129,10 @@ def test_default_kv_sharing_pairs_consecutive_blocks():
     size = len(cfg.block_pattern)
     assert cfg.kv_owner(1 * size + 1) == 1  # block 2's D4 reads block 1's D4
     assert cfg.kv_owner(size + 0) is None   # S layers always compute their own
-    assert cfg.kv_owner(3 * size + 5) == 2 * size + 5
+    assert cfg.kv_owner(size + 2) is None
+    assert cfg.kv_owner(3 * size + 4) == 2 * size + 4  # D16
+    assert cfg.kv_owner(3 * size + 5) == 2 * size + 5  # G
+    assert sorted(cfg.kv_share) == [size + 1, size + 3, size + 4, size + 5, 3 * size + 1, 3 * size + 3, 3 * size + 4, 3 * size + 5]
     assert tiny_config(num_blocks=4, kv_share={}).kv_share == {}
 
 

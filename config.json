@@ -6,19 +6,26 @@
   "adaptive_div": 2,
   "attention_sinks": true,
   "attention_types": {
+    "D16": {
+      "conv": 4,
+      "dilation": 4,
+      "kv_heads": 8,
+      "rope": true,
+      "window": 16384
+    },
     "D4": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 4,
       "rope": true,
-      "window": 2048
+      "window": 4096
     },
     "D8": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 4,
       "rope": true,
-      "window": 4096
+      "window": 8192
     },
     "G": {
       "conv": 4,
@@ -32,7 +39,7 @@
       "dilation": 1,
       "kv_heads": 8,
       "rope": true,
-      "window": 2048
+      "window": 4096
     }
   },
   "auto_map": {
@@ -45,7 +52,7 @@
     "D4",
     "S",
     "D8",
-    "S",
+    "D16",
     "G"
   ],
   "bos_token_id": 1,
@@ -64,15 +71,19 @@
   "kv_share": {
     "7": 1,
     "9": 3,
+    "10": 4,
     "11": 5,
     "19": 13,
     "21": 15,
+    "22": 16,
     "23": 17,
     "31": 25,
     "33": 27,
+    "34": 28,
     "35": 29,
     "43": 37,
     "45": 39,
+    "46": 40,
     "47": 41
   },
   "lin_chunk": 256,
