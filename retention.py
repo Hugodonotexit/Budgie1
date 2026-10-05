@@ -187,6 +187,27 @@ def to_device(x, device, host_wait_back=False):
     return _ToDevice.apply(x, device, host_wait_back)
 
 
+def branch_half_lives(config: BudgieConfig, block: int):
+    """The decay half-life (tokens) of each head of `block`'s branch, a list of `lin_heads` floats.
+
+    One grid: head j of H sits at fraction (j + block / num_blocks) / H of the way (in log2) across
+    `lin_half_life_range`, so the blocks, staggered, together cover the range more densely.
+
+    A widened branch (`lin_base_heads` = B < H, see grow_branch.py): heads 0..B-1 stay exactly where the
+    B-head grid put them, because their weights were trained for those decays. Head B + k, with
+    j = k % B and m = 1 + k // B, goes m / H past old head j (wrapping around the range), which makes the
+    union of the two sets one even grid of H points spaced 1/H apart."""
+    lo, hi = config.lin_half_life_range
+    H, base, off = config.lin_heads, config.lin_base_heads or config.lin_heads, block / config.num_blocks
+    log_lo, span = math.log2(lo), math.log2(hi) - math.log2(lo)
+    out = [2.0 ** (log_lo + span * (j + off) / base) for j in range(base)]
+    for k in range(H - base):
+        j, m = k % base, 1 + k // base
+        frac = ((j + off) / base + m / H) % 1.0
+        out.append(2.0 ** (log_lo + span * frac))
+    return out
+
+
 class RetentionBranch(GradientCheckpointingLayer):
     """The retention branch of one block: y = g * Wo(head_norm(retention(conv(norm(x0))))).
 
@@ -216,8 +237,7 @@ class RetentionBranch(GradientCheckpointingLayer):
         # Fixed decay half-lives, log-uniform over lin_half_life_range and staggered by block so the blocks
         # together cover the range more densely. Plain floats, not a buffer: a buffer would be rounded by
         # model.half() and left uninitialized by from_pretrained's meta-device construction.
-        lo, hi = config.lin_half_life_range
-        self._half_life = [2.0 ** (math.log2(lo) + (math.log2(hi) - math.log2(lo)) * (j + block / config.num_blocks) / H) for j in range(H)]
+        self._half_life = branch_half_lives(config, block)
         self._half_life_on = {}  # device -> tensor: building it from the list is a blocking host-to-device copy
         self.stats = None  # set when a caller turns on `record_stats`
         self.record_stats = False

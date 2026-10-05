@@ -3,14 +3,20 @@
 Budgie is a decoder-only language model built from **windowed, dilated and global attention layers**, with
 depthwise causal convolutions in front of every attention and feed-forward block, a deeper-than-usual FFN,
 hashed n-gram input embeddings and an adaptive-softmax output head. This repository holds the model code,
-the tokenizer and the chat template in Hugging Face format. **There are no weights here yet**: nothing is
-released, and the repository is code only.
+the tokenizer and the chat template in Hugging Face format.
+
+**This repository is the model framework only**: modelling code, configuration, tokenizer and tests. It has no
+weights, training code or data. Trained models are published on Hugging Face, in the
+**Budgie1.0-1B** collection of [Hugodonotexit](https://huggingface.co/Hugodonotexit). The collection does not
+exist yet; its link will be added here when it does.
 
 The default configuration (`BudgieConfig()`) is 48 layers, hidden size 1024, 16 heads of 128 dims,
-**0.96 B parameters** (0.955 B with the retention branch off), vocabulary 42,000.
+**0.99 B parameters** (0.955 B with the retention branch off), vocabulary 42,000.
 
-> Status: the code, tokenizer and tests are working; a model trained with this code is still in progress.
-> Until weights are published, the examples below build a randomly initialised model.
+![Budgie structure: the layer stack, one decoder layer, and the attention patterns](docs/structure.svg)
+
+> Status: the code, tokenizer and tests are working; the Budgie1.0-1B models are still being trained. Until they
+> are published, the examples below build a randomly initialised model.
 
 ## Install
 
@@ -55,15 +61,18 @@ print(config.num_hidden_layers, sum(p.numel() for p in model.parameters()) / 1e9
 
 ### Load a checkpoint
 
-A checkpoint directory (weights + `config.json` + the code files, written by `save_pretrained`) loads
-anywhere, without this repository installed:
+Models in the [Budgie1.0-1B collection](https://huggingface.co/Hugodonotexit) (once it exists) are checkpoint
+directories: weights, `config.json`, the tokenizer and a copy of the code files, as written by `save_pretrained`.
+They load anywhere, without this repository installed:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("path/to/checkpoint", trust_remote_code=True)
-tok = AutoTokenizer.from_pretrained("path/to/checkpoint")
+model = AutoModelForCausalLM.from_pretrained("Hugodonotexit/<model name>", trust_remote_code=True)
+tok = AutoTokenizer.from_pretrained("Hugodonotexit/<model name>")
 ```
+
+`<model name>` is a model in the collection; a local checkpoint directory works the same way.
 
 Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pretrained(".", subfolder="tokenizer")`.
 
@@ -111,8 +120,8 @@ trained on the thinking and tool tokens yet.
 * **Embeddings.** A frequency-sorted adaptive embedding (clusters of width d, d/2, d/4) plus hashed 2- and 3-gram
   tables with two independent hash heads each, projected up to the hidden size. The output head is an adaptive
   softmax tied to the same tables, with logits soft-capped at 50.
-* **Retention branch (optional, on by default).** A fixed-decay linear-attention branch per block that writes a gated
-  term into the residual stream just before the block's first `G` layer. `linear_branch="none"` removes it
+* **Retention branch (optional, on by default).** A fixed-decay linear-attention branch per block (16 heads × 64)
+  that writes a gated term into the residual stream just before the block's first `G` layer. `linear_branch="none"` removes it
   (no modules, and no `lin_*` keys in `config.json`).
 
 [docs/architecture.md](docs/architecture.md) describes each part and every configuration field.
@@ -140,8 +149,9 @@ configuration validation, `save_pretrained` → `from_pretrained` including load
 | `cache.py` | `BudgieCache` |
 | `norms.py`, `rotary.py`, `decoder.py` | RMSNorm / QKNorm, rotary embeddings, decoder layer |
 | `tokenizer/` | tokenizer and chat template |
+| `config.json`, `generation_config.json` | default architecture and generation settings |
 | `tests/` | pytest suite |
-| `docs/` | architecture and tokenizer notes |
+| `docs/` | architecture and tokenizer notes, and the structure diagram (`structure.svg`, drawn from `config.json` by `make_structure_diagram.py`) |
 
 ## Licence
 

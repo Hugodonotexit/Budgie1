@@ -14,6 +14,9 @@ dependencies = [
     "safetensors",
 ]
 
+[project.urls]
+Models = "https://huggingface.co/Hugodonotexit"
+
 [project.optional-dependencies]
 # CUDA kernel for the depthwise causal convs; without it the model uses an equivalent PyTorch path.
 fast = ["causal-conv1d>=1.6"]

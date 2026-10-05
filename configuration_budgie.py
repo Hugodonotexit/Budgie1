@@ -19,7 +19,8 @@ DEFAULT_PATTERN = ("S", "D4", "S", "D8", "S", "G")
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
 SHARED_KINDS = ("D4", "D8", "G")
 LINEAR_BRANCH_MODES = ("none", "before_G", "after_G")
-LINEAR_BRANCH_KEYS = ("lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate")
+LINEAR_BRANCH_KEYS = ("lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
+                      "lin_base_heads")
 
 
 class BudgieConfig(PretrainedConfig):
@@ -65,6 +66,9 @@ class BudgieConfig(PretrainedConfig):
     input, in parallel with the local layers, and adds its gated output to the residual stream just
     before the block's first G layer. It resets at every document start (a `bos_token_id` token).
     `lin_head_gate` adds a per-token, per-head sigmoid gate on the branch's head outputs.
+    `lin_base_heads` is set when a trained branch was widened (grow_branch.py): its first `lin_base_heads`
+    heads keep the half-lives they were trained with, and the other heads take the positions in between
+    (see retention.branch_half_lives). None (not written to config.json) = every head is on one grid.
     Turned off, the model has no extra modules or parameters, and the `lin_*` fields are not written
     to config.json, and a config.json without `linear_branch` (written before the branch existed, or
     with it off) loads as "none" whatever the default above is.
@@ -96,13 +100,14 @@ class BudgieConfig(PretrainedConfig):
         adaptive_div=2,
         logit_softcap=50.0,
         linear_branch="before_G",
-        lin_heads=4,
+        lin_heads=16,
         lin_head_dim=64,
         lin_conv_kernel=4,
-        lin_chunk=128,
+        lin_chunk=256,
         lin_half_life_range=(256, 32768),
         lin_gate_init=0.05,
         lin_head_gate=True,
+        lin_base_heads=None,
         rms_norm_eps=1e-5,
         rope_theta=10000.0,
         max_position_embeddings=65536,
@@ -177,6 +182,7 @@ class BudgieConfig(PretrainedConfig):
         self.lin_conv_kernel, self.lin_chunk = int(lin_conv_kernel), int(lin_chunk)
         self.lin_half_life_range = [float(lin_half_life_range[0]), float(lin_half_life_range[1])]
         self.lin_gate_init, self.lin_head_gate = float(lin_gate_init), bool(lin_head_gate)
+        self.lin_base_heads = None if lin_base_heads is None else int(lin_base_heads)
         if linear_branch not in LINEAR_BRANCH_MODES:
             raise ValueError(f"linear_branch must be one of {LINEAR_BRANCH_MODES}, got {linear_branch!r}")
         if linear_branch != "none":
@@ -187,6 +193,9 @@ class BudgieConfig(PretrainedConfig):
             lo, hi = self.lin_half_life_range
             if self.lin_heads < 1 or self.lin_conv_kernel < 2 or self.lin_chunk < 1 or not 0 < lo <= hi:
                 raise ValueError("need lin_heads >= 1, lin_conv_kernel >= 2, lin_chunk >= 1 and 0 < lin_half_life_range[0] <= [1]")
+            base = self.lin_base_heads
+            if base is not None and not (1 <= base <= self.lin_heads and self.lin_heads % base == 0):
+                raise ValueError(f"lin_base_heads must divide lin_heads ({self.lin_heads}), got {base}")
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -232,6 +241,8 @@ class BudgieConfig(PretrainedConfig):
             d.pop("linear_branch", None)
             for key in LINEAR_BRANCH_KEYS:
                 d.pop(key, None)
+        elif d.get("lin_base_heads") is None:
+            d.pop("lin_base_heads", None)   # a branch that was never widened writes the same config.json as before
         return d
 
     @property

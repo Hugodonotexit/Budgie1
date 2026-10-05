@@ -3,6 +3,11 @@
 All numbers are the defaults of `BudgieConfig()` unless stated. Everything is configurable; see the
 [configuration reference](#configuration-reference).
 
+![Budgie structure](structure.svg)
+
+The diagram is generated from `config.json` by `docs/make_structure_diagram.py` (standard library only); re-run it
+after changing the defaults.
+
 ## Layout of the stack
 
 A **block** is a sequence of layer kinds, `block_pattern = (S, D4, S, D8, S, G)`, and the model is
@@ -84,7 +89,9 @@ S_t = γ S_{t−1} + (1 − γ) k_t v_tᵀ        (fp32, reset at every <bos>)
 o_t = q_tᵀ S_t / (1 − γ^n)                n = tokens since the document start
 ```
 
-Half-lives are spread log-uniformly over `lin_half_life_range` (256 … 32768 tokens), `q` and `k` are L2-normalised,
+Each branch has `lin_heads` (16) heads of `lin_head_dim` (64). Half-lives are spread log-uniformly over
+`lin_half_life_range` (256 … 32768 tokens) and staggered from block to block, so the blocks together cover the
+range more densely; `q` and `k` are L2-normalised,
 and the output is multiplied by a learned scalar `g` (initially `lin_gate_init = 0.05`) and, if `lin_head_gate`, a
 per-token per-head sigmoid. The recurrence is evaluated `lin_chunk` tokens at a time; `retention_reference` in
 `retention.py` is the token-by-token fp64 oracle. `"after_G"` is reserved but not implemented. With
@@ -118,7 +125,8 @@ accepted.
 | `adaptive_cutoffs`, `adaptive_div` | (2048, 8192), 2 | frequency clusters and width ratio; `[]` = full softmax |
 | `logit_softcap` | 50.0 | 0/None disables |
 | `linear_branch` | `before_G` | `none` / `before_G` |
-| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 4, 64, 4, 128 | branch shape |
+| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 16, 64, 4, 256 | branch shape |
+| `lin_base_heads` | none | set when a trained branch was widened: its first `lin_base_heads` heads keep their original half-lives and the other heads take the positions in between (`retention.branch_half_lives`). Omitted from `config.json` when none |
 | `lin_half_life_range`, `lin_gate_init`, `lin_head_gate` | (256, 32768), 0.05, true | branch decay and gating |
 | `rms_norm_eps`, `rope_theta` | 1e-5, 10000 | |
 | `max_position_embeddings` | 65536 | not enforced; rotary has no table |

@@ -75,7 +75,7 @@
     "45": 39,
     "47": 41
   },
-  "lin_chunk": 128,
+  "lin_chunk": 256,
   "lin_conv_kernel": 4,
   "lin_gate_init": 0.05,
   "lin_half_life_range": [
@@ -84,7 +84,7 @@
   ],
   "lin_head_dim": 64,
   "lin_head_gate": true,
-  "lin_heads": 4,
+  "lin_heads": 16,
   "linear_branch": "before_G",
   "logit_softcap": 50.0,
   "max_position_embeddings": 65536,
