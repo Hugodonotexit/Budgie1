@@ -34,6 +34,7 @@ from .attention import Attention
 from .cache import BudgieCache
 from .configuration_budgie import BudgieConfig
 from .convolution import CausalConv
+from .decode import try_fast_decode
 from .decoder import DecoderLayer
 from .embeddings import BudgieEmbedding
 from .head import AdaptiveSoftmaxHead
@@ -118,6 +119,13 @@ class BudgieModel(BudgiePreTrainedModel):
                 raise ValueError("past_key_values must be a BudgieCache (the model's own cache), or empty")
             past_key_values = BudgieCache(cfg)  # replaces the generic cache generate() may have made
         cache = past_key_values if use_cache else None
+
+        if cache is not None:
+            hidden = try_fast_decode(self, cache, input_ids, attention_mask)  # graph-replayed single-token step
+            if hidden is not None:
+                return BaseModelOutputWithPast(last_hidden_state=hidden, past_key_values=cache)
+            if cache.fast_engine is not None:  # an ordinary call after fast decoding: take the state back
+                cache.fast_engine.release()
 
         x = self.embed(input_ids, cache) if inputs_embeds is None else inputs_embeds
         T = x.shape[1]

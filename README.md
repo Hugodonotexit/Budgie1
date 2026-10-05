@@ -84,6 +84,12 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
 * **The cache is a `BudgieCache`.** Each layer keeps only the keys a later query can still see (window ×
   dilation tokens, everything for global layers, nothing for layers that read another layer's K/V), plus the
   convolution states. `generate()` creates one for you.
+* **Single-token decoding runs as a CUDA graph.** On a GPU, `decode.py` replays one captured graph per generated
+  token (fixed-size ring buffers for K/V, conv and retention states updated in place) instead of launching
+  ~6000 small kernels, which makes decoding about 10x faster at 1k-4k tokens of context and about 7x at 16k.
+  It is used for unpadded, `no_grad`, single-token steps; padded batches, beam search, `inputs_embeds` and CPU
+  take the eager path, and the cache hands its state back whenever anything else needs it. Set
+  `BUDGIE_FAST_DECODE=0` to turn it off.
 * **The tokenizer wraps raw text in `<bos> … <eos>`.** `tok("text")` ends with `<eos>`, which is wrong for a
   prompt you want continued. For continuation use `tok(text, add_special_tokens=False)` after prepending
   `tok.bos_token` yourself, or use the chat template. For scoring benchmarks (e.g. lm-evaluation-harness) turn
@@ -134,7 +140,8 @@ pytest tests                # CPU only, about 15 s
 
 They cover shapes and log-probabilities, causality, cached decoding against a full forward pass, `generate`,
 configuration validation, `save_pretrained` → `from_pretrained` including loading in a fresh process with
-`trust_remote_code`, and the tokenizer, special tokens and chat template.
+`trust_remote_code`, and the tokenizer, special tokens and chat template. `tests/test_decode.py` checks the
+CUDA-graph decode path against the eager one and is skipped when there is no GPU.
 
 ## Repository layout
 
@@ -147,6 +154,7 @@ configuration validation, `save_pretrained` → `from_pretrained` including load
 | `embeddings.py`, `head.py` | adaptive + n-gram input, adaptive-softmax head |
 | `retention.py` | the retention branch |
 | `cache.py` | `BudgieCache` |
+| `decode.py` | the CUDA-graph decode path (ring-buffer state, captured single-token step) |
 | `norms.py`, `rotary.py`, `decoder.py` | RMSNorm / QKNorm, rotary embeddings, decoder layer |
 | `tokenizer/` | tokenizer and chat template |
 | `config.json`, `generation_config.json` | default architecture and generation settings |

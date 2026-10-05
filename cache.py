@@ -39,8 +39,34 @@ class BudgieCache(Cache):
         super().__init__(layers=layers)
         self.last_ids = None
         self.last_doc_pos = None
+        self.fast_engine = None  # the decode.FastDecoder currently holding this cache's state, if any
+        self.no_fast = False     # set when this cache must stay on the eager path (padded batch, beam search...)
+
+    def get_seq_length(self, layer_idx=0):
+        if self.fast_engine is not None:
+            return self.fast_engine.pos_host
+        return super().get_seq_length(layer_idx)
+
+    def _leave_fast(self):
+        """Take the state back from the decode engine before anything edits the cache directly."""
+        if self.fast_engine is not None:
+            self.fast_engine.release()
+        self.no_fast = True
+
+    def crop(self, *args, **kwargs):
+        self._leave_fast()
+        return super().crop(*args, **kwargs)
+
+    def batch_repeat_interleave(self, *args, **kwargs):
+        self._leave_fast()
+        return super().batch_repeat_interleave(*args, **kwargs)
+
+    def batch_select_indices(self, *args, **kwargs):
+        self._leave_fast()
+        return super().batch_select_indices(*args, **kwargs)
 
     def reorder_cache(self, beam_idx):
+        self._leave_fast()
         super().reorder_cache(beam_idx)
         if self.last_ids is not None:
             self.last_ids = self.last_ids.index_select(0, beam_idx.to(self.last_ids.device))
