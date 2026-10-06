@@ -108,10 +108,13 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
   It is used for unpadded, `no_grad`, single-token steps; padded batches, beam search, `inputs_embeds` and CPU
   take the eager path, and the cache hands its state back whenever anything else needs it. Set
   `BUDGIE_FAST_DECODE=0` to turn it off.
-* **The tokenizer wraps raw text in `<bos> … <eos>`.** `tok("text")` ends with `<eos>`, which is wrong for a
-  prompt you want continued. For continuation use `tok(text, add_special_tokens=False)` after prepending
-  `tok.bos_token` yourself, or use the chat template. For scoring benchmarks (e.g. lm-evaluation-harness) turn
-  the automatic BOS off in the harness, or the scores are meaningless.
+* **`tok(text)` gives `<bos> text`.** There is no trailing `<eos>`, so a prompt can be continued as it is (the way
+  Llama-style tokenizers behave); `tok(text, add_special_tokens=False)` gives the bare ids. A training document is
+  `<bos> text <eos>`: append `tok.eos_token_id` yourself when you build one. For lm-evaluation-harness use
+  `add_bos_token=True` (`--model_args pretrained=<model>,trust_remote_code=True,add_bos_token=True`): the model needs
+  the `<bos>` that documents start with, and with it the context and continuation carry no `<eos>`. A `tokenizer.json`
+  from before this change still ends every text with `<eos>`; delete the `<eos>` entries of its `post_processor`
+  (`single` and `pair`) to match.
 * **Documents are separated by `<bos>`.** The retention branch resets its state at every `<bos>`.
 
 ### Chat, thinking and tools

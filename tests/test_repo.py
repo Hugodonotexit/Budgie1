@@ -56,6 +56,38 @@ def test_think_and_tool_tokens_are_single_ids_that_survive_decoding(tok):
     assert tok.decode(encoded, skip_special_tokens=True) == text  # generation parsing needs them kept
 
 
+def test_plain_tokenization_is_bos_text_without_eos(tok):
+    bos, eos = tok.bos_token_id, tok.eos_token_id
+    for text in ("hi", "a longer sentence, with punctuation.", ""):
+        ids = tok(text)["input_ids"]
+        assert ids[0] == bos and eos not in ids
+    assert tok("hi")["input_ids"] == [bos, *tok("hi", add_special_tokens=False)["input_ids"]]
+    pair = tok("a", "b")["input_ids"]
+    assert pair[0] == bos and eos not in pair
+    assert all(b[0] == bos and eos not in b for b in tok(["x", "yz"])["input_ids"])
+    assert tok("hi" + tok.eos_token)["input_ids"][-1] == eos      # an <eos> written in the text is still one token
+
+
+def test_model_max_length_matches_the_config(tok):
+    assert tok.model_max_length == BudgieConfig.from_pretrained(ROOT).max_position_embeddings == 65536
+    assert len(tok("word " * 3000)["input_ids"]) > 1024
+
+
+def test_chat_template_tokenize_true_is_unchanged_and_has_no_eos(tok):
+    msgs = [{"role": "user", "content": "hi"}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+    ids = enc["input_ids"] if hasattr(enc, "keys") else enc
+    assert ids == [1, 4, 230, 5184, 6, 230, 5, 230]            # what it returned before the post-processor lost its <eos>
+    tools = [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
+    conv = [{"role": "system", "content": "S"}, {"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "u2"}]
+    for kw in (dict(), dict(enable_thinking=False), dict(tools=tools)):
+        text = tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=True, **kw)
+        enc = tok.apply_chat_template(conv, tokenize=True, add_generation_prompt=True, **kw)
+        got = enc["input_ids"] if hasattr(enc, "keys") else enc
+        assert got == tok.encode(text, add_special_tokens=False)    # tokenized without special tokens, so the post-processor is not involved
+        assert got.count(tok.bos_token_id) == 1 and tok.eos_token_id not in got
+
+
 def test_chat_template_without_extras_is_the_plain_format(tok):
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}, {"role": "user", "content": "again"}]
     got = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)

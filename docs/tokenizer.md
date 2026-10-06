@@ -20,8 +20,20 @@
   reasoning and tool calls can be parsed from decoded text. To make them special, set `"special": true` on
   their entries in `tokenizer.json` and list them in `special_tokens_map.json`.
 * The reserved ids were renamed in place, so the vocabulary size and the embedding shape did not change.
-* Plain `tok(text)` returns `<bos> … <eos>`. The chat template writes `<bos>` itself, and
-  `apply_chat_template` tokenizes without adding specials.
+* **Plain `tok(text)` returns `<bos> text`**, with no trailing `<eos>`: the post-processor adds `<bos>` only (for a
+  pair, `tok(a, b)` is `<bos> a b`). So a prompt can be continued as it is, and benchmark harnesses that tokenize
+  with special tokens on (lm-evaluation-harness with `add_bos_token=True`) give every context and continuation a
+  `<bos>` and no `<eos>`. Turning BOS off in a harness is not a substitute: the model expects `<bos>` at the start of
+  a document, and the retention branch resets its state there.
+* **A training document is `<bos> text <eos>`**, and the tokenizer no longer writes the `<eos>` for you: append
+  `tok.eos_token_id` yourself (`tok(text)["input_ids"] + [tok.eos_token_id]`, or `[bos, *ids, eos]` from
+  `add_special_tokens=False`).
+* The chat template writes `<bos>` itself, and `apply_chat_template` tokenizes without adding specials, so it is
+  not affected by the post-processor.
+* `model_max_length` is 65536, the configuration's `max_position_embeddings`; the old value, 1024, made every longer
+  text warn.
+* A `tokenizer.json` saved before this change (the post-processor template was `<bos> $A <eos>`) still appends
+  `<eos>`. Delete the `<eos>` entries from `post_processor.single` and `post_processor.pair` to bring it in line.
 
 ## Chat template
 
