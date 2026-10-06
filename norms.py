@@ -3,6 +3,8 @@
 import torch
 from torch import nn
 
+from .kernels import rms_norm, use
+
 
 class RMSNorm(nn.Module):
     """Root-mean-square norm over the last dimension with a learned per-channel scale.
@@ -15,6 +17,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if use("rms_norm", x):
+            return rms_norm(x, self.weight, self.eps).to(self.weight.dtype)   # Liger: one pass, one rounding
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return self.weight * x.to(self.weight.dtype)

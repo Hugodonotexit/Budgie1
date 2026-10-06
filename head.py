@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from .kernels import IGNORE, linear_cross_entropy, use
 from .configuration_budgie import BudgieConfig
 from .embeddings import AdaptiveInput
 
@@ -45,6 +46,8 @@ class AdaptiveSoftmaxHead(nn.Module):
         states h and target ranks (-1 = ignore)."""
         cuts = self.cuts
         valid, tgt = rank >= 0, rank.clamp_min(0)
+        if use("loss", h):
+            return self._token_nll_fused(h, valid, tgt, table), valid
         head, tails = self._logits(h, table)
         head = self._cap(head)
         if tails:
@@ -59,6 +62,46 @@ class AdaptiveSoftmaxHead(nn.Module):
             inside = torch.logsumexp(logits, -1) - logits.gather(1, local[:, None])[:, 0]
             nll = nll + torch.where(cluster == i, inside, torch.zeros_like(inside))
         return torch.where(valid, nll, torch.zeros_like(nll)), valid
+
+    def _clusters(self, tgt):
+        """(cluster of every target rank, its row in the first-cluster logits)."""
+        cuts = self.cuts
+        if len(cuts) > 2:
+            cluster = torch.bucketize(tgt, torch.tensor(cuts[1:-1], device=tgt.device), right=True)
+            return cluster, torch.where(cluster == 0, tgt, cuts[1] + cluster - 1)
+        return torch.zeros_like(tgt), tgt
+
+    def _fused_parts(self, h, valid, tgt, table):
+        """What Liger's fused linear cross entropy is run on, one part per cluster: (rows, hidden, weight, target) with
+        rows None for every row. The first cluster (its embedding rows plus the cluster-choice vectors) sees every token;
+        a tail cluster sees only the tokens that fall in it, through the projection that takes the hidden state down to
+        that cluster's width. Ignored tokens carry the ignore index, so they count 0."""
+        cuts, ignore = self.cuts, IGNORE
+        cluster, head_idx = self._clusters(tgt)
+        weight = table.tok[0].weight
+        if self.cluster_vectors is not None:
+            weight = torch.cat([weight, self.cluster_vectors.to(weight.dtype)], 0)
+        yield None, h, weight, torch.where(valid, head_idx, ignore)
+        for i in range(1, len(table.tok)):
+            rows = (valid & (cluster == i)).nonzero(as_tuple=True)[0]
+            if rows.numel():
+                local = (tgt.index_select(0, rows) - cuts[i]).clamp(0, cuts[i + 1] - cuts[i] - 1)
+                yield rows, h.index_select(0, rows) @ table.proj[i - 1].weight, table.tok[i].weight, local
+
+    def _fused_loss(self, h, rank, table):
+        """Mean negative log-likelihood by Liger's fused linear cross entropy, which never builds the logits. Same value
+        and gradients as the chunked loss below."""
+        valid = rank >= 0
+        total = sum(linear_cross_entropy(x, w, t, self.softcap, "sum") for _, x, w, t in self._fused_parts(h, valid, rank.clamp_min(0), table))
+        return total / valid.sum().clamp_min(1)
+
+    def _token_nll_fused(self, h, valid, tgt, table):
+        """_token_nll by the same fused kernel, per token (no gradient): no [tokens, vocabulary] logits at all."""
+        nll = torch.zeros(h.shape[0], dtype=torch.float32, device=h.device)
+        for rows, x, w, t in self._fused_parts(h, valid, tgt, table):
+            each = linear_cross_entropy(x, w, t, self.softcap, "none")
+            nll = nll + each if rows is None else nll.index_add(0, rows, each)
+        return nll
 
     def _nll(self, h, rank, table):
         """Summed negative log-likelihood and token count."""
@@ -82,6 +125,8 @@ class AdaptiveSoftmaxHead(nn.Module):
         h = hidden[:, :-1].reshape(-1, hidden.shape[-1])
         tgt = labels[:, 1:].reshape(-1).to(h.device)
         rank = torch.where(tgt >= 0, table.rank_of[tgt.clamp_min(0)], torch.full_like(tgt, -1))
+        if use("loss", h):
+            return self._fused_loss(h, rank, table)
         total, count = h.new_zeros((), dtype=torch.float32), rank.new_zeros(())
         for start in range(0, h.shape[0], LOSS_CHUNK):
             args = (h[start:start + LOSS_CHUNK], rank[start:start + LOSS_CHUNK])

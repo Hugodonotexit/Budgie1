@@ -3,6 +3,8 @@
 import torch
 import torch.nn.functional as F
 
+from .kernels import FLAGS, attention_backward, attention_forward
+
 SINK_PAD = 8  # extra head-dim columns for the sink; 8 keeps the memory-efficient kernel's alignment
 
 
@@ -56,7 +58,8 @@ def sdpa_window(q, k, v, scale, sinks, window, tail=False):
     """Causal attention over tokens 0 .. T-1 in which token i sees keys i - window + 1 .. i (window
     None: all of 0 .. i), plus the learned sink. Same result as the sink-column trick in sdpa() with the
     equivalent mask, but it runs the memory-efficient kernel's own sliding-window mode: no mask, no
-    padded head dim, and key blocks outside the window are skipped. Measured on a V100 (16 heads x 64,
+    padded head dim, and key blocks outside the window are skipped (with kernels.configure(xformers=True) the same CUTLASS kernel is
+    reached through xformers' API; see kernels.py). Measured on a V100 (16 heads x 64,
     window 2048, forward + backward): 1.7x faster at T 2048, 2.9x at 4096, 2.6x at 16k.
 
     q, k, v: [B, H, T, D] (k, v already expanded to H heads); sinks: [H].
@@ -83,9 +86,12 @@ def _window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sinks: 
     """q [B, Tq, H, D], k, v [B, Tk, H, D] contiguous; mask_type 1 = causal from the top left (Tq == Tk), 2 = from
     the bottom right (the queries are the last Tq of the Tk keys). Returns (output [B, Tq, H, D], L [B, H, Tq] fp32)."""
     T = q.shape[1]
-    out, lse, _, _, _, _ = torch.ops.aten._efficient_attention_forward(
-        q, k, v, None, None, None, None, None, 0.0, mask_type, True, scale=scale, window_size=window)
-    lse = lse[:, :, :T]
+    if FLAGS["attention"] and (window is None or mask_type == 1):    # xformers' CUTLASS kernel (config.FUSED_KERNELS)
+        out, lse = attention_forward(q, k, v, scale, window, mask_type)
+    else:
+        out, lse, _, _, _, _ = torch.ops.aten._efficient_attention_forward(
+            q, k, v, None, None, None, None, None, 0.0, mask_type, True, scale=scale, window_size=window)
+        lse = lse[:, :, :T]
     total = torch.logaddexp(lse, sinks.float()[None, :, None])
     out = (out.float() * torch.exp(lse - total).transpose(1, 2)[..., None]).to(q.dtype)
     return out, total.contiguous()
@@ -103,10 +109,13 @@ def _window_attention_backward(grad: torch.Tensor, q: torch.Tensor, k: torch.Ten
                                mask_type: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     T = q.shape[1]
     grad = grad.contiguous()
-    lse = F.pad(total, (0, (-T) % 32)).contiguous()          # the kernel keeps its log-sum-exp padded to 32
-    unused = torch.zeros((), dtype=torch.int64)              # dropout seed / offset; no dropout
-    dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
-        grad, q, k, v, None, out, None, None, T, k.shape[1], lse, 0.0, unused, unused, mask_type, False, scale=scale, window_size=window)
+    if FLAGS["attention"] and (window is None or mask_type == 1):
+        dq, dk, dv = attention_backward(grad, q, k, v, out, total, scale, window, mask_type)
+    else:
+        lse = F.pad(total, (0, (-T) % 32)).contiguous()          # the kernel keeps its log-sum-exp padded to 32
+        unused = torch.zeros((), dtype=torch.int64)              # dropout seed / offset; no dropout
+        dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
+            grad, q, k, v, None, out, None, None, T, k.shape[1], lse, 0.0, unused, unused, mask_type, False, scale=scale, window_size=window)
     dot = (grad.float() * out.float()).sum(-1).transpose(1, 2)                   # <dO_i, O_i>, [B, H, T]
     dsink = -(torch.exp(sinks.float()[None, :, None] - total) * dot).sum((0, 2)).to(sinks.dtype)
     return dq, dk, dv, dsink

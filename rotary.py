@@ -3,6 +3,8 @@
 import torch
 from torch import nn
 
+from .kernels import rope, use
+
 
 class RotaryEmbedding(nn.Module):
     """Rotary embeddings (half-split convention). It has no parameters or buffers on purpose: the
@@ -29,6 +31,8 @@ class RotaryEmbedding(nn.Module):
     @classmethod
     def apply(cls, x, cos, sin):
         """x: [batch, heads, seq, head_dim]. Rotates in fp32, returns x's dtype."""
+        if use("rope", x):
+            return rope(x, cos, sin)
         cos, sin = cos[:, None], sin[:, None]
         xf = x.float()
         return (xf * cos + cls.rotate_half(xf) * sin).to(x.dtype)

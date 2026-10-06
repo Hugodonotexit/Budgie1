@@ -25,12 +25,30 @@ git clone <this repository> budgie
 cd budgie
 pip install -e .            # exposes the repo root as the package `budgie`
 pip install -e ".[fast]"    # optional: the causal-conv1d CUDA kernel
+pip install -e ".[kernels]" # optional: Liger and xformers kernels (off until switched on, see below)
 pip install -e ".[dev]"     # optional: pytest
 ```
 
 Requires Python 3.10+, `torch>=2.6` and `transformers>=5.15` (developed against transformers 5.15 and
 torch 2.13). Without `causal-conv1d` the model uses an equivalent PyTorch convolution, which gives the same
 results; the kernel is a little faster on GPU.
+
+### Optional fused kernels
+
+`budgie/kernels.py` can run the RMSNorm / QK-norm and rotary embedding with Liger's Triton kernels, the embedding lookups with
+Liger's embedding kernel, the loss with Liger's fused linear cross entropy (summed for training, per token for evaluation;
+the vocabulary logits are never built), and the window attention through xformers' CUTLASS kernel. They are off by default and
+every call site keeps its PyTorch path:
+
+```python
+from budgie import kernels
+kernels.configure(liger=True, xformers=True)     # or one kernel: rms_norm, rope, loss, embedding, attention; or BUDGIE_KERNELS=liger,xformers
+print(kernels.self_check(torch.device("cuda")))  # runs each enabled kernel on small tensors against PyTorch; a failing one switches itself off
+```
+
+Liger kernels the architecture has no use for (SwiGLU / GeGLU, LayerNorm, modulated RMSNorm, multi-token attention, softmax,
+sparsemax, mHC, the int2 x int8 matmul) are not used. `tests/test_kernels.py` (needs a CUDA GPU) compares every kernel with the PyTorch path on the
+model's own code, forward and backward.
 
 ## Use
 

@@ -24,6 +24,8 @@ Models = "https://huggingface.co/Hugodonotexit"
 [project.optional-dependencies]
 # CUDA kernel for the depthwise causal convs; without it the model uses an equivalent PyTorch path.
 fast = ["causal-conv1d>=1.6"]
+# Liger (RMSNorm, RoPE, fused cross entropy) and xformers (attention) kernels, switched on with budgie.kernels.configure(...).
+kernels = ["liger-kernel>=0.8", "xformers>=0.0.35"]
 dev = ["pytest"]
 
 # The repository root *is* the model directory (flat modules, so that trust_remote_code can copy

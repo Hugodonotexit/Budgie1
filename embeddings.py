@@ -5,6 +5,12 @@ from torch import nn
 
 from .cache import BudgieCache
 from .configuration_budgie import NGRAM_HASH_BASES, BudgieConfig
+from .kernels import embedding, use
+
+
+def look_up(table, ids):
+    """table(ids): an nn.Embedding (or the trainer's int8 stand-in for one), through Liger's embedding kernel when that is on."""
+    return embedding(ids, table.weight) if use("embedding", table.weight) else table(ids)
 
 
 class AdaptiveInput(nn.Module):
@@ -38,7 +44,7 @@ class AdaptiveInput(nn.Module):
         out = None
         for i, table in enumerate(self.tok):
             lo, hi = self.cuts[i], self.cuts[i + 1]
-            e = table((rank - lo).clamp(0, hi - lo - 1))
+            e = look_up(table, (rank - lo).clamp(0, hi - lo - 1))
             if i > 0:
                 e = torch.where(((rank >= lo) & (rank < hi))[..., None], self.proj[i - 1](e), out)
             out = e
@@ -106,7 +112,7 @@ class HashedNgramEmbedding(nn.Module):
         hist = cache.last_ids if cache is not None and cache.last_ids is not None else ids.new_full((B, keep), self.pad_id)
         ctx = torch.cat([hist, ids], 1)  # the previous `keep` ids, then these
         for n, table, proj in zip(self.orders, self.tables, self.proj):
-            rows = table(self.bucket_ids(ctx, n, keep, T))  # [B, T, heads, dim]
+            rows = look_up(table, self.bucket_ids(ctx, n, keep, T))  # [B, T, heads, dim]
             x = x + proj(rows.reshape(B, T, -1))
         if cache is not None and keep:
             cache.last_ids = ctx[:, -keep:].clone()
