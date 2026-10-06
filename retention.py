@@ -12,6 +12,7 @@ normalized. `retention_reference` is the token-by-token fp64 oracle; `retention_
 thing `chunk` tokens at a time with every exponent <= 0.
 """
 
+import functools
 import math
 
 import torch
@@ -26,6 +27,7 @@ from .cache import BRANCH_CONV
 from .configuration_budgie import BudgieConfig
 from .convolution import CausalConv
 from .norms import RMSNorm
+from .offload import offload_checkpoint
 
 
 def document_positions(is_bos, prev=None, valid=None):
@@ -270,14 +272,18 @@ class RetentionBranch(GradientCheckpointingLayer):
             return module(*args)
         return functional_call(module, {k: weights[f"{name}.{k}"] for k, _ in module.named_parameters()}, args)
 
-    def forward(self, x0, cache: Cache | None, doc_pos, token_mask, weights=None):
-        """`weights`: parameter name -> tensor to use in its place (forward_on's copies)."""
-        B, T, _ = x0.shape
-        H, dk = self.heads, self.head_dim
+    def forward(self, x0, cache: Cache | None, doc_pos, token_mask, weights=None, S_init=None, drop=0, return_state=False):
+        """`weights`: parameter name -> tensor to use in its place (forward_on's copies).
+        `S_init`, `drop`, `return_state` are for forward_segmented: the state carried in from the previous
+        segment, the number of leading tokens of x0 that only supply the conv's context (their outputs are
+        discarded, and `doc_pos` covers only the tokens after them), and whether to return (out, S)."""
+        B, H, dk = x0.shape[0], self.heads, self.head_dim
         gain, g = (self.gain, self.g) if weights is None else (weights["gain"], weights["g"])
         u = self._sub("conv", weights, self._sub("norm", weights, x0), cache, token_mask)
+        if drop:
+            u = u[:, drop:]
+        T = u.shape[1]
         q, k, v = (self._sub(proj, weights, u).view(B, T, H, dk) for proj in ("q_proj", "k_proj", "v_proj"))
-        S_init = None
         if cache is not None:
             layer = cache.layers[self.layer_idx]
             if layer.is_recurrent_states_initialized[0]:
@@ -294,4 +300,29 @@ class RetentionBranch(GradientCheckpointingLayer):
         if self.record_stats:
             self.stats = {"pre_norm_max": o.detach().abs().amax(dim=(1, 2, 3)), "state_max": S.detach().abs().amax(dim=(1, 2, 3)),
                           "out_rms": out.detach().pow(2).mean(dim=(1, 2)).sqrt()}
-        return out
+        return (out, S) if return_state else out
+
+    def _segment(self, x_ext, S_in, doc_pos, *, drop):
+        out, S = self.forward(x_ext, None, doc_pos, None, S_init=S_in, drop=drop, return_state=True)
+        return out.to(x_ext.dtype), S
+
+    def forward_segmented(self, x0, doc_pos, segment, pool=None):
+        """forward() without a cache, `segment` tokens at a time, for sequences whose whole-sequence activations
+        do not fit (the branch needs ~100 MiB per 1k tokens in forward plus backward). The recurrent state is
+        carried from one segment to the next, the conv gets its (width - 1) tokens of context by overlapping
+        the segments, and with `pool` every segment is checkpointed with its input in pinned host memory, so
+        backward only ever holds one segment. The result equals forward()'s: the segment is a multiple of
+        the chunk, so the chunk boundaries are the same. Returns [B, T, d] in x0's dtype."""
+        B, T, _ = x0.shape
+        segment = max(self.chunk, segment // self.chunk * self.chunk)
+        context = self.conv.width - 1
+        outs, S = [], None
+        for start in range(0, T, segment):
+            end, lo = min(start + segment, T), max(0, start - context)
+            run = functools.partial(self._segment, drop=start - lo)
+            if pool is not None:
+                out, S = offload_checkpoint(run, pool, x0[:, lo:end], S, doc_pos[:, start:end])
+            else:
+                out, S = run(x0[:, lo:end], S, doc_pos[:, start:end])
+            outs.append(out)
+        return torch.cat(outs, 1)

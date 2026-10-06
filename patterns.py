@@ -3,7 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-from .sdpa import sdpa, sdpa_window, window_attention_supported
+from .sdpa import repeat_kv, sdpa, sdpa_window, window_attention_supported
 
 
 class AttentionPattern:
@@ -69,6 +69,47 @@ class AttentionPattern:
         fold = lambda t: t.reshape(B, H, L, d, D).permute(0, 3, 1, 2, 4).reshape(B * d, H, L, D)
         out = self._causal_window(fold(q), fold(k), fold(v), sinks, scale)
         return out.reshape(B, d, H, L, D).permute(0, 2, 3, 1, 4).reshape(B, H, T + pad, D)[:, :, :T]
+
+    def attend_chunk(self, q, k, v, start, sinks, scale, n_rep):
+        """The queries at positions start .. start + Tq - 1 of a whole sequence, attending over that sequence's
+        K/V: q [B, H, Tq, D]; k, v [B, kv_heads, T, D] (not expanded). Equals attend() on the whole sequence
+        restricted to those queries, so a long sequence can be done a chunk at a time with only K/V at full
+        length. With dilation d, `start` and Tq must be multiples of d (and so is the end of the keys it reads,
+        which is `start + Tq`). The key slice is expanded to the query heads one K/V head at a time (n_rep query
+        heads each): all at once it is [B, H, keys, D] twice, which for a global layer at 128k is 1 GiB."""
+        Tq, d = q.shape[2], self.dilation
+        end = start + Tq
+        lo = 0 if self.window is None else max(0, start - (self.window - 1) * d)
+        lo -= lo % d
+        if not window_attention_supported(q, sinks):
+            return self.attend_masked(q, repeat_kv(k[:, :, lo:end], n_rep), repeat_kv(v[:, :, lo:end], n_rep),
+                                      torch.arange(start, end, device=q.device), torch.arange(lo, end, device=q.device), None, sinks, scale)
+        if d > 1 and (start % d or Tq % d):
+            raise ValueError(f"a dilation-{d} chunk must start and end on a multiple of {d} (start {start}, length {Tq})")
+        outs = []
+        for g in range(k.shape[1]):
+            heads = slice(g * n_rep, (g + 1) * n_rep)
+            outs.append(self._chunk_group(q[:, heads], repeat_kv(k[:, g:g + 1, lo:end], n_rep), repeat_kv(v[:, g:g + 1, lo:end], n_rep),
+                                          (start - lo) // d, sinks[heads], scale))
+        return torch.cat(outs, 1)
+
+    def _chunk_group(self, q, kc, vc, pad, sinks, scale):
+        """One group of heads of attend_chunk; kc, vc are the key slice [lo, end) already expanded to q's heads."""
+        d = self.dilation
+        B, H, Tq, D = q.shape
+        if d > 1:
+            fold = lambda t: t.reshape(B, H, t.shape[2] // d, d, D).permute(0, 3, 1, 2, 4).reshape(B * d, H, t.shape[2] // d, D)
+            q, kc, vc = fold(q), fold(kc), fold(vc)
+        if self.window is None:
+            out = sdpa_window(q, kc, vc, scale, sinks, None, tail=True)
+        else:
+            # The kernel's backward is wrong for a window together with a bottom-right-aligned mask (measured against a
+            # float32 reference: relative error ~1 in dq, dk and dv; the forward is right). So the queries are padded
+            # with `pad` empty rows in front, which lines the diagonal up under an ordinary top-left mask.
+            out = sdpa_window(torch.nn.functional.pad(q, (0, 0, pad, 0)), kc, vc, scale, sinks, self.window)[:, :, pad:]
+        if d > 1:
+            out = out.reshape(B, d, H, Tq // d, D).permute(0, 2, 3, 1, 4).reshape(B, H, Tq, D)
+        return out
 
     def attend_masked(self, q, k, v, q_pos, k_pos, key_ok, sinks, scale):
         """The same attention from an explicit mask built out of absolute positions. key_ok [B, Tk]

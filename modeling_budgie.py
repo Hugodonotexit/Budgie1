@@ -86,13 +86,36 @@ class BudgieModel(BudgiePreTrainedModel):
             self._g_pos = config.block_pattern.index("G")  # the first G layer of a block
             size = len(config.block_pattern)
             self.branches = nn.ModuleList([RetentionBranch(config, b, b * size + self._g_pos) for b in range(config.num_blocks)])
+        # The layers whose K/V some later layer reads (config.kv_share): only these are kept while the stack runs.
+        self._kv_last_reader = {}
+        for j in range(config.num_hidden_layers):
+            if config.kv_owner(j) is not None:
+                self._kv_last_reader[config.kv_owner(j)] = j
         self.record_branch_stats = False  # set by a caller that wants per-block branch statistics
         self.branch_stats = []
         # Set by a trainer (not saved): a torch.device to run every block's retention branch on, alongside
         # the block's local layers on the model's own GPU. Forwards without a cache only.
         self.branch_device = None
+        # Set by set_long_context_mode (not saved): the HostPool and the segment length of the retention branch.
+        self.offload_pool = None
+        self.branch_segment = None
         self.gradient_checkpointing = False
         self.post_init()
+
+    def set_long_context_mode(self, pool, branch_segment=None, compile_halves=False, chunk=None):
+        """Training on sequences too long for whole-layer checkpointing (see offload.py): every layer is
+        checkpointed in two halves with its input in pinned host memory, and the retention branches run
+        `branch_segment` tokens at a time with the same treatment, on the model's own GPU (a `branch_device`
+        copy of the whole sequence would not fit the other GPU either). `pool` None switches it all off.
+        `chunk`: layer halves of sequences longer than this run a chunk at a time, forward and backward
+        (chunked.py), which bounds the working set by the chunk instead of the sequence.
+        The trainer turns Hugging Face's gradient checkpointing off while this is on."""
+        self.offload_pool = pool
+        self.branch_segment = branch_segment if pool is not None else None
+        for layer in self.layers:
+            layer.set_offload(pool, compile_halves, chunk)
+        if pool is not None:
+            pool.clear()
 
     def get_input_embeddings(self):
         return self.embed.adaptive.tok[0]
@@ -146,7 +169,8 @@ class BudgieModel(BudgiePreTrainedModel):
             doc_pos = document_positions(is_bos, cache.last_doc_pos if cache is not None else None, token_mask)
             self.branch_stats = []
             block_size = len(cfg.block_pattern)
-            remote = self.branch_device if cache is None and self.branch_device not in (None, x.device) else None
+            segmented = cache is None and self.branch_segment is not None
+            remote = self.branch_device if cache is None and not segmented and self.branch_device not in (None, x.device) else None
             if remote is not None:
                 doc_pos_remote = to_device(doc_pos, remote)
                 mask_remote = None if token_mask is None else to_device(token_mask, remote)
@@ -162,7 +186,10 @@ class BudgieModel(BudgiePreTrainedModel):
                     if remote is not None:  # queued now, so the other GPU works through it during the local layers
                         pending = branch.forward_on(remote, block_input, doc_pos_remote, mask_remote)
                 if pos == self._g_pos:  # the branch reads the stream from the start of the block and writes just before G
-                    if remote is None:
+                    if segmented and token_mask is None:
+                        pool = self.offload_pool if torch.is_grad_enabled() else None
+                        out = branch.forward_segmented(block_input, doc_pos, self.branch_segment, pool).to(x.dtype)
+                    elif remote is None:
                         out = branch(block_input, cache, doc_pos, token_mask).to(x.dtype)
                     else:
                         out, pending = to_device(pending.to(x.dtype), x.device), None
@@ -173,8 +200,10 @@ class BudgieModel(BudgiePreTrainedModel):
                     x = x + out
             owner = cfg.kv_owner(i)
             x, kv = layer(x, cos_sin, cache, shared[owner] if owner is not None else None, token_mask, attention_mask, past)
-            if owner is None:
+            if owner is None and i in self._kv_last_reader:   # not every owner is read; its K/V must not outlive the layer then
                 shared[i] = kv
+            elif owner is not None and self._kv_last_reader[owner] == i:
+                del shared[owner]                      # nothing reads it after this layer
         if self.branches is not None and cache is not None:
             cache.last_doc_pos = doc_pos[:, -1].clone()
         return BaseModelOutputWithPast(last_hidden_state=self.norm(x), past_key_values=cache)

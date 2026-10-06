@@ -52,16 +52,20 @@ def window_attention_supported(q, sinks):
     return q.is_cuda and sinks is not None and q.shape[-1] % 8 == 0 and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
 
-def sdpa_window(q, k, v, scale, sinks, window):
+def sdpa_window(q, k, v, scale, sinks, window, tail=False):
     """Causal attention over tokens 0 .. T-1 in which token i sees keys i - window + 1 .. i (window
     None: all of 0 .. i), plus the learned sink. Same result as the sink-column trick in sdpa() with the
     equivalent mask, but it runs the memory-efficient kernel's own sliding-window mode: no mask, no
     padded head dim, and key blocks outside the window are skipped. Measured on a V100 (16 heads x 64,
     window 2048, forward + backward): 1.7x faster at T 2048, 2.9x at 4096, 2.6x at 16k.
 
-    q, k, v: [B, H, T, D] (k, v already expanded to H heads); sinks: [H]."""
+    q, k, v: [B, H, T, D] (k, v already expanded to H heads); sinks: [H].
+
+    tail=True: the queries are the LAST Tq positions of the Tk keys (Tq <= Tk), so query j sits at key index
+    Tk - Tq + j (a chunk of queries over the keys up to and including it; verified against a masked reference
+    on the memory-efficient kernel, which supports a bottom-right-aligned causal mask together with a window)."""
     qt, kt, vt = (x.transpose(1, 2).contiguous() for x in (q, k, v))   # [B, T, H, D], the kernel's layout
-    out, _ = _window_attention(qt, kt, vt, sinks, float(scale), window)
+    out, _ = _window_attention(qt, kt, vt, sinks, float(scale), window, 2 if tail else 1)
     return out.transpose(1, 2)
 
 
@@ -75,11 +79,12 @@ def sdpa_window(q, k, v, scale, sinks, window):
 
 @torch.library.custom_op("budgie::window_attention", mutates_args=())
 def _window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sinks: torch.Tensor, scale: float,
-                      window: int | None) -> tuple[torch.Tensor, torch.Tensor]:
-    """q, k, v: [B, T, H, D] contiguous. Returns (output [B, T, H, D], L [B, H, T] fp32)."""
+                      window: int | None, mask_type: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """q [B, Tq, H, D], k, v [B, Tk, H, D] contiguous; mask_type 1 = causal from the top left (Tq == Tk), 2 = from
+    the bottom right (the queries are the last Tq of the Tk keys). Returns (output [B, Tq, H, D], L [B, H, Tq] fp32)."""
     T = q.shape[1]
     out, lse, _, _, _, _ = torch.ops.aten._efficient_attention_forward(
-        q, k, v, None, None, None, None, None, 0.0, 1, True, scale=scale, window_size=window)
+        q, k, v, None, None, None, None, None, 0.0, mask_type, True, scale=scale, window_size=window)
     lse = lse[:, :, :T]
     total = torch.logaddexp(lse, sinks.float()[None, :, None])
     out = (out.float() * torch.exp(lse - total).transpose(1, 2)[..., None]).to(q.dtype)
@@ -87,41 +92,41 @@ def _window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sinks: 
 
 
 @_window_attention.register_fake
-def _(q, k, v, sinks, scale, window):
+def _(q, k, v, sinks, scale, window, mask_type=1):
     B, T, H, _ = q.shape
     return torch.empty_like(q), q.new_empty(B, H, T, dtype=torch.float32)
 
 
 @torch.library.custom_op("budgie::window_attention_backward", mutates_args=())
 def _window_attention_backward(grad: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor,
-                               total: torch.Tensor, sinks: torch.Tensor, scale: float,
-                               window: int | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                               total: torch.Tensor, sinks: torch.Tensor, scale: float, window: int | None,
+                               mask_type: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     T = q.shape[1]
     grad = grad.contiguous()
     lse = F.pad(total, (0, (-T) % 32)).contiguous()          # the kernel keeps its log-sum-exp padded to 32
     unused = torch.zeros((), dtype=torch.int64)              # dropout seed / offset; no dropout
     dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
-        grad, q, k, v, None, out, None, None, T, T, lse, 0.0, unused, unused, 1, False, scale=scale, window_size=window)
+        grad, q, k, v, None, out, None, None, T, k.shape[1], lse, 0.0, unused, unused, mask_type, False, scale=scale, window_size=window)
     dot = (grad.float() * out.float()).sum(-1).transpose(1, 2)                   # <dO_i, O_i>, [B, H, T]
     dsink = -(torch.exp(sinks.float()[None, :, None] - total) * dot).sum((0, 2)).to(sinks.dtype)
     return dq, dk, dv, dsink
 
 
 @_window_attention_backward.register_fake
-def _(grad, q, k, v, out, total, sinks, scale, window):
+def _(grad, q, k, v, out, total, sinks, scale, window, mask_type=1):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v), torch.empty_like(sinks)
 
 
 def _window_setup_context(ctx, inputs, output):
-    q, k, v, sinks, scale, window = inputs
+    q, k, v, sinks, scale, window, mask_type = inputs
     ctx.save_for_backward(q, k, v, output[0], output[1], sinks)
-    ctx.scale, ctx.window = scale, window
+    ctx.scale, ctx.window, ctx.mask_type = scale, window, mask_type
 
 
 def _window_backward(ctx, grad_out, grad_total):
     q, k, v, out, total, sinks = ctx.saved_tensors
-    dq, dk, dv, dsink = _window_attention_backward(grad_out, q, k, v, out, total, sinks, ctx.scale, ctx.window)
-    return dq, dk, dv, dsink, None, None
+    dq, dk, dv, dsink = _window_attention_backward(grad_out, q, k, v, out, total, sinks, ctx.scale, ctx.window, ctx.mask_type)
+    return dq, dk, dv, dsink, None, None, None
 
 
 _window_attention.register_autograd(_window_backward, setup_context=_window_setup_context)
