@@ -19,20 +19,21 @@ def tok():
 
 def test_config_json_loads_and_points_at_files_in_this_repo():
     cfg = BudgieConfig.from_pretrained(ROOT)
-    assert cfg.model_type == "budgie" and cfg.num_hidden_layers == len(cfg.block_pattern) * cfg.num_blocks
+    assert cfg.model_type == "budgie" and cfg.num_hidden_layers == len(cfg.layer_pattern) * cfg.num_blocks
     for target in json.loads((ROOT / "config.json").read_text())["auto_map"].values():
         assert (ROOT / (target.split(".")[0] + ".py")).exists(), target
 
 
 def test_default_layer_structure():
     cfg = BudgieConfig()
-    assert cfg.block_pattern == ["S", "D4", "S", "D8", "D16", "G"] and cfg.num_hidden_layers == 48
-    assert cfg.attention_types["S"]["window"] == 4096 and cfg.attention_types["D4"]["window"] == 4096
-    assert cfg.attention_types["D8"] == {"window": 8192, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4}
-    assert cfg.attention_types["D16"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8}
+    assert cfg.block_pattern == ["N", "S", "D1-4", "D1-2", "D4-16", "D1-2", "D16-64", "S", "SUM", "D64-256", "D128-256", "G_shared", "G"]
+    assert cfg.num_hidden_layers == 96 and cfg.has_branch and cfg.branch_pos == 8 and cfg.layer_pattern[cfg.branch_pos] == "D64-256"
+    assert cfg.attention_types["D16-64"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4}
+    assert cfg.attention_types["D128-256"] == {"window": 131072, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 2}
+    assert cfg.attention_types["G"]["window"] is None and not cfg.attention_types["G"]["rope"]
     kinds = cfg.layer_kinds
     readers = {i for i in cfg.kv_share}
-    assert all(kinds[i] != "S" for i in readers) and {kinds[i] for i in readers} == {"D4", "D8", "D16", "G"}
+    assert {kinds[i] for i in readers} == {"D1-4", "D4-16", "D16-64", "D64-256", "D128-256", "G_shared"}
     assert json.loads((ROOT / "config.json").read_text())["block_pattern"] == cfg.block_pattern, "config.json is stale: regenerate it"
 
 
@@ -69,7 +70,7 @@ def test_plain_tokenization_is_bos_text_without_eos(tok):
 
 
 def test_model_max_length_matches_the_config(tok):
-    assert tok.model_max_length == BudgieConfig.from_pretrained(ROOT).max_position_embeddings == 65536
+    assert tok.model_max_length == BudgieConfig.from_pretrained(ROOT).max_position_embeddings == 524288
     assert len(tok("word " * 3000)["input_ids"]) > 1024
 
 
@@ -77,7 +78,7 @@ def test_chat_template_tokenize_true_is_unchanged_and_has_no_eos(tok):
     msgs = [{"role": "user", "content": "hi"}]
     enc = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
     ids = enc["input_ids"] if hasattr(enc, "keys") else enc
-    assert ids == [1, 4, 230, 5184, 6, 230, 5, 230]            # what it returned before the post-processor lost its <eos>
+    assert ids[:8] == [1, 4, 230, 5184, 6, 230, 5, 230] and ids[8:] == tok.encode("<think>\n", add_special_tokens=False)
     tools = [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
     conv = [{"role": "system", "content": "S"}, {"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "u2"}]
     for kw in (dict(), dict(enable_thinking=False), dict(tools=tools)):
@@ -91,16 +92,16 @@ def test_chat_template_tokenize_true_is_unchanged_and_has_no_eos(tok):
 def test_chat_template_without_extras_is_the_plain_format(tok):
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}, {"role": "user", "content": "again"}]
     got = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    assert got == "<bos><|system|>\nS<|end|>\n<|user|>\nhi<|end|>\n<|assistant|>\nyo<|end|>\n<|user|>\nagain<|end|>\n<|assistant|>\n"
+    assert got == "<bos><|system|>\nS<|end|>\n<|user|>\nhi<|end|>\n<|assistant|>\nyo<|end|>\n<|user|>\nagain<|end|>\n<|assistant|>\n<think>\n"
 
 
-def test_enable_thinking_toggle(tok):
+def test_thinking_is_always_on(tok):
     msgs = [{"role": "user", "content": "hi"}]
-    on = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    on_explicit = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-    off = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    assert on == on_explicit and on.endswith("<|assistant|>\n")
-    assert off == on + "<think>\n\n</think>\n\n"
+    outs = {tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **kw)
+            for kw in (dict(), dict(enable_thinking=True), dict(enable_thinking=False))}
+    assert outs == {"<bos><|user|>\nhi<|end|>\n<|assistant|>\n<think>\n"}           # no toggle
+    done = tok.apply_chat_template(msgs + [{"role": "assistant", "content": "yo"}], tokenize=False)
+    assert done.endswith("<|assistant|>\n<think>\n\n</think>\n\nyo<|end|>\n")         # no reasoning: an empty block
 
 
 def test_reasoning_is_kept_only_after_the_last_user_turn(tok):
@@ -120,6 +121,6 @@ def test_tool_calls_and_responses(tok):
             {"role": "tool", "content": "18C"}, {"role": "tool", "content": "20C"}]
     out = tok.apply_chat_template(msgs, tools=tools, tokenize=False, add_generation_prompt=True)
     assert out.startswith("<bos><|system|>\n# Tools") and "<tools>\n" in out and '"name": "get_weather"' in out
-    assert ('<|assistant|>\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>\n'
+    assert ('<|assistant|>\n<think>\n\n</think>\n\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>\n'
             '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Rome"}}\n</tool_call><|end|>\n') in out
-    assert out.endswith("<|user|>\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n20C\n</tool_response><|end|>\n<|assistant|>\n")
+    assert out.endswith("<|user|>\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n20C\n</tool_response><|end|>\n<|assistant|>\n<think>\n")

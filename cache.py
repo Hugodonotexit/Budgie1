@@ -12,7 +12,7 @@ from .patterns import AttentionPattern
 # Slots of the three causal convs in a layer's cache: before Q, before the FFN, before K/V.
 Q_CONV, FFN_CONV, KV_CONV = 0, 1, 2
 N_CONV_STATES = 3
-BRANCH_CONV = 3  # the retention branch's conv; a slot is only allocated when config.linear_branch != "none"
+BRANCH_CONV = 3  # the retention branch's conv; a slot is only allocated when config.has_branch
 
 
 class BudgieCache(Cache):
@@ -21,11 +21,11 @@ class BudgieCache(Cache):
     plus the three causal-conv states. Also the last few token ids, which the n-gram embeddings need.
 
     With the retention branch on there is a fourth conv slot per layer, and the branch of each block
-    keeps its fp32 state in slot 0 of `recurrent_states` of that block's first G layer. `last_doc_pos`
+    keeps its fp32 state in slot 0 of `recurrent_states` of the layer after that block's SUM. `last_doc_pos`
     is each sequence's position within its current document after the last call (int64 [B])."""
 
     def __init__(self, config):
-        n_states = N_CONV_STATES + (1 if config.linear_branch != "none" else 0)
+        n_states = N_CONV_STATES + (1 if config.has_branch else 0)
         layers = []
         for i in range(config.num_hidden_layers):
             pattern = AttentionPattern.from_spec(config.layer_spec(i))

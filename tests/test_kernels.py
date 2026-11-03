@@ -25,10 +25,10 @@ DEV = "cuda"
 AT_IMPORT = dict(kernels.FLAGS)   # what the package does by itself, before any test configures anything
 TYPES = {   # windows shorter than the 192-token test sequences, so the windowed paths really cut keys
     "S": {"window": 64, "dilation": 1, "conv": 3, "rope": True, "kv_heads": 2},
-    "D4": {"window": 24, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
-    "D8": {"window": 32, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
-    "D16": {"window": 40, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
-    "G": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 4},
+    "D1-4": {"window": 24, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
+    "D4-16": {"window": 32, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
+    "D16-64": {"window": 40, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},
+    "G_shared": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 4},
 }
 
 
@@ -41,7 +41,7 @@ def restore_flags():
 
 def make_model(dtype=torch.float16, seed=0, **kw):
     cfg = dict(vocab_size=6000, hidden_size=256, num_attention_heads=4, head_dim=128, attention_types=TYPES, num_blocks=1,
-               intermediate_size=(512, 512, 512), adaptive_cutoffs=(256, 1024), ngram_buckets=4096, linear_branch="none",
+               intermediate_size=(512, 512, 512), adaptive_cutoffs=(256, 1024), ngram_buckets=4096, block_pattern=("S", "D1-4", "S", "D4-16", "D16-64", "G_shared"),
                max_position_embeddings=1024)
     cfg.update(kw)
     torch.manual_seed(seed)

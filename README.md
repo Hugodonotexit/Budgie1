@@ -10,13 +10,19 @@ weights, training code or data. Trained models are published on Hugging Face, in
 **Budgie1.0-1B** collection of [Hugodonotexit](https://huggingface.co/Hugodonotexit). The collection does not
 exist yet; its link will be added here when it does.
 
-The default configuration (`BudgieConfig()`) is 48 layers, hidden size 1024, 16 heads of 128 dims,
-**0.98 B parameters** (0.947 B with the retention branch off), vocabulary 42,000.
+The default configuration (`BudgieConfig()`) is 8 blocks of 12 layers (96 layers), hidden size 1024, 16 heads of
+128 dims, **2.10 B parameters** (1.83 B with the retention branch off), vocabulary 42,000, positions up to 512k.
+The model is trained by growing it one block at a time, so smaller depths matter too:
+
+| `num_blocks` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| parameters | 0.34 B | 0.59 B | 0.84 B | 1.09 B | 1.34 B | 1.59 B | 1.85 B | 2.10 B |
 
 ![Budgie structure: the layer stack, one decoder layer, and the attention patterns](docs/structure.svg)
 
-> Status: the code, tokenizer and tests are working; the Budgie1.0-1B models are still being trained. Until they
-> are published, the examples below build a randomly initialised model.
+> Status: the code, tokenizer and tests are working. The layout changed on 2026-11-03 (the 12-layer block below) and
+> training restarted from scratch; the Budgie1.0 models are not published yet. Until they are, the examples below
+> build a randomly initialised model.
 
 ## Install
 
@@ -123,33 +129,36 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
 msgs = [{"role": "user", "content": "What is 17 * 23?"}]
 
 tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-# <bos><|user|>\nWhat is 17 * 23?<|end|>\n<|assistant|>\n
-
-tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False)
-# ... <|assistant|>\n<think>\n\n</think>\n\n          (thinking switched off)
+# <bos><|user|>\nWhat is 17 * 23?<|end|>\n<|assistant|>\n<think>\n
 ```
 
-`enable_thinking` defaults to on. The template also handles `reasoning_content`, `tools=[...]` and
+**Thinking is always on; there is no toggle.** The generation prompt opens a `<think>` block, the model writes its
+reasoning, closes it with `</think>` and answers. When nothing needs working out it closes the block straight away
+(`<think>\n\n</think>\n\n`), which is also how answers without reasoning are written in the training data. An
+`enable_thinking` argument is ignored. The template also handles `reasoning_content`, `tools=[...]` and
 `tool_calls`; see [docs/tokenizer.md](docs/tokenizer.md) for the exact format. Note that no checkpoint has been
 trained on the thinking and tool tokens yet.
 
 ## Architecture in short
 
-* **Layers.** A block is `S D4 S D8 D16 G`, repeated `num_blocks` times (8 by default → 48 layers). `S` is local
-  attention (window 4096), `D4`, `D8` and `D16` are dilated (stride 4: windows of 4096, 8192 and 16384 tokens,
-  reaching 16k, 32k and 64k back), `G` is global attention without positional encoding. Every layer is
-  `x += attn(norm(x))` then `x += ffn(norm(x))`.
+* **Layers.** A block is `N S D1-4 D1-2 D4-16 D1-2 D16-64 S SUM D64-256 D128-256 G_shared G`, repeated `num_blocks`
+  times (8 by default → 96 layers; `SUM` is not a layer). `N` and `S` are local attention (windows 1k and 2k); the
+  `D` layers are dilated, named by window and reach (`D16-64`: a 16k window at stride 4 reaching 64k back), up to
+  `D128-256`, which reaches 256k; `G_shared` and `G` are global attention without positional encoding. Every layer
+  is `x += attn(norm(x))` then `x += ffn(norm(x))`.
 * **Attention.** Grouped-query, with a depthwise causal convolution on Q and another on K/V, QK-norm, rotary
-  positions (not in `G`), and a learned sink logit per head. Every second block (2nd, 4th, …) reuses the K/V of the block
-  before them in their `D4`, `D8`, `D16` and `G` layers (`kv_share`), which cuts the KV cache.
+  positions (not in the global layers), and a learned sink logit per head. Every second block (2nd, 4th, …) reuses the
+  K/V of the block before it in its `D1-4`, `D4-16`, `D16-64`, `D64-256`, `D128-256` and `G_shared` layers
+  (`kv_share`), which cuts the KV cache.
 * **FFN.** A causal convolution, then four matrices `d → 2048 → 2048 → 2048 → d`; SiLU after the first and last hidden
   layer and a centred dSiLU after the middle one.
 * **Embeddings.** A frequency-sorted adaptive embedding (clusters of width d, d/2, d/4) plus hashed 2- and 3-gram
   tables with two independent hash heads each, projected up to the hidden size. The output head is an adaptive
   softmax tied to the same tables, with logits soft-capped at 50.
-* **Retention branch (optional, on by default).** A fixed-decay linear-attention branch per block (16 heads × 64)
-  that writes a gated term into the residual stream just before the block's first `G` layer. `linear_branch="none"` removes it
-  (no modules, and no `lin_*` keys in `config.json`).
+* **Retention branch (on when `block_pattern` has a `SUM`).** A fixed-decay linear-attention branch per block (64 heads ×
+  128, half-lives 1k–262k tokens) that reads the block's input and writes a gated term into the residual stream at the
+  `SUM`, just before the layer that follows it. A pattern without `SUM` has no branch (no modules, and no `lin_*` keys
+  in `config.json`).
 
 [docs/architecture.md](docs/architecture.md) describes each part and every configuration field.
 

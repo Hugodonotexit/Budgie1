@@ -10,16 +10,25 @@ after changing the defaults.
 
 ## Layout of the stack
 
-A **block** is a sequence of layer kinds, `block_pattern = (S, D4, S, D8, D16, G)`, and the model is
-`num_blocks` blocks (8 → 48 layers; `num_hidden_layers` is derived and cannot be set).
+A **block** is a sequence of layer kinds, `block_pattern = (N, S, D1-4, D1-2, D4-16, D1-2, D16-64, S, SUM, D64-256,
+D128-256, G_shared, G)`, and the model is `num_blocks` blocks (8 → 96 layers; `num_hidden_layers` counts the entries
+other than `SUM` and cannot be set). `SUM` is not a layer: it marks where the retention branch is added back.
 
 | Kind | Window | Dilation | Reach | Rotary | KV heads | Conv kernel |
 |---|---|---|---|---|---|---|
-| `S` local | 4096 | 1 | 4k | yes | 8 | 3 |
-| `D4` dilated | 4096 | 4 | 16k | yes | 4 | 4 |
-| `D8` dilated | 8192 | 4 | 32k | yes | 4 | 4 |
-| `D16` dilated | 16384 | 4 | 64k | yes | 8 | 4 |
-| `G` global | all | 1 | all | no | 8 | 4 |
+| `N` local | 1024 | 1 | 1k | yes | 16 | 2 |
+| `S` local | 2048 | 1 | 2k | yes | 8 | 2 |
+| `D1-2` dilated | 1024 | 2 | 2k | yes | 8 | 2 |
+| `D1-4` dilated | 1024 | 4 | 4k | yes | 8 | 4 |
+| `D4-16` dilated | 4096 | 4 | 16k | yes | 8 | 4 |
+| `D16-64` dilated | 16384 | 4 | 64k | yes | 4 | 4 |
+| `D64-256` dilated | 65536 | 4 | 256k | yes | 4 | 4 |
+| `D128-256` dilated | 131072 | 2 | 256k | yes | 2 | 2 |
+| `G_shared` global | all | 1 | all | no | 2 | 2 |
+| `G` global | all | 1 | all | no | 1 | 2 |
+
+The names give window and reach in k tokens (`D16-64`: window 16k, reach 64k). Rotary uses `rope_theta = 5e5`, so
+its slowest dimension turns once in ~2.6M tokens, beyond any trained length.
 
 A query at position *i* in a dilated layer sees *i, i−d, i−2d, …* (*window* tokens). Dilation is implemented
 by dealing the tokens into *d* interleaved sequences, each an ordinary windowed problem, so a dilated layer
@@ -49,8 +58,9 @@ with the residual stream kept in fp32 (`fp32_residual`) and a final RMSNorm befo
   (`enable_gqa` falls back to the slow math kernel on some GPUs).
 * **KV sharing** (`kv_share`): a map from a *reader* layer to an earlier *owner* layer of the same kind. A reader
   keeps its own Q projection, output projection and FFN, and has no K/V projection, K/V convolution, K/V norm or
-  cache. The default makes every second block read the previous block's `D4`, `D8`, `D16` and `G` K/V (every kind
-  except `S`). `{}` turns it off.
+  cache. The default makes every second block read the previous block's K/V in the kinds of `SHARED_KINDS`
+  (`D1-4`, `D4-16`, `D16-64`, `D64-256`, `D128-256`, `G_shared`); `N`, `S`, `D1-2` and `G` always keep their own.
+  `{}` turns it off.
 
 ## Feed-forward
 
@@ -81,9 +91,9 @@ moved to the origin). Its range is (−0.0998, 1.0998).
 
 ## Retention branch
 
-With `linear_branch="before_G"`, each block has one RetNet-style linear-attention branch that reads the residual
+With a `SUM` in `block_pattern`, each block has one RetNet-style linear-attention branch that reads the residual
 stream at the start of the block (own RMSNorm and causal convolution), runs in parallel with the block's local layers
-and adds a gated output just before the block's first `G` layer. Per head, with a fixed decay
+and adds a gated output at the `SUM`, just before the layer that follows it (`SUM` is not a layer). Per head, with a fixed decay
 `γ = exp(−ln 2 / half_life)`:
 
 ```
@@ -91,20 +101,20 @@ S_t = γ S_{t−1} + (1 − γ) k_t v_tᵀ        (fp32, reset at every <bos>)
 o_t = q_tᵀ S_t / (1 − γ^n)                n = tokens since the document start
 ```
 
-Each branch has `lin_heads` (16) heads of `lin_head_dim` (64). Half-lives are spread log-uniformly over
-`lin_half_life_range` (256 … 32768 tokens) and staggered from block to block, so the blocks together cover the
+Each branch has `lin_heads` (64) heads of `lin_head_dim` (128). Half-lives are spread log-uniformly over
+`lin_half_life_range` (1024 … 262144 tokens) and staggered from block to block, so the blocks together cover the
 range more densely; `q` and `k` are L2-normalised,
 and the output is multiplied by a learned scalar `g` (initially `lin_gate_init = 0.05`) and, if `lin_head_gate`, a
 per-token per-head sigmoid. The recurrence is evaluated `lin_chunk` tokens at a time; `retention_reference` in
-`retention.py` is the token-by-token fp64 oracle. `"after_G"` is reserved but not implemented. With
-`linear_branch="none"` the model has no branch modules and `config.json` carries no `lin_*` keys; a `config.json`
-without `linear_branch` loads as `"none"`.
+`retention.py` is the token-by-token fp64 oracle. Without a `SUM` the model has no branch modules and `config.json`
+carries no `lin_*` keys. A `config.json` from before `SUM` (with `linear_branch`) loads as `"before_G"` = a `SUM` before
+the first `G`, anything else = no branch.
 
 ## Cache
 
 `BudgieCache` holds, per layer, the keys and values that a later query can still see (`(window − 1) · dilation`
 past tokens; everything for `G`; nothing for a KV-sharing reader) and the states of the causal convolutions (Q, FFN,
-K/V, and the branch's). The retention branch's fp32 state lives in the block's first `G` layer; `last_doc_pos` tracks
+K/V, and the branch's). The retention branch's fp32 state lives in the layer that follows the block's `SUM`; `last_doc_pos` tracks
 the position within the current document. A `BudgieCache` is created automatically; a generic `DynamicCache` is not
 accepted.
 
@@ -114,7 +124,7 @@ accepted.
 |---|---|---|
 | `vocab_size` | 42000 | must match the tokenizer |
 | `hidden_size` | 1024 | *d* |
-| `block_pattern` | `S D4 S D8 D16 G` | layer kinds of one block |
+| `block_pattern` | `N S D1-4 D1-2 D4-16 D1-2 D16-64 S SUM D64-256 D128-256 G_shared G` | layer kinds of one block, plus at most one `SUM` (the retention branch; not last) |
 | `num_blocks` | 8 | blocks in the stack |
 | `attention_types` | see above | per kind: `window`, `dilation`, `conv`, `rope`, `kv_heads` |
 | `num_attention_heads`, `head_dim` | 16, 128 | `kv_heads` of every kind must divide the head count |
@@ -126,12 +136,11 @@ accepted.
 | `ngram_orders`, `ngram_buckets`, `ngram_dim`, `ngram_heads` | (2, 3), 262144, d/8, 2 | hashed n-gram input |
 | `adaptive_cutoffs`, `adaptive_div` | (2048, 8192), 2 | frequency clusters and width ratio; `[]` = full softmax |
 | `logit_softcap` | 50.0 | 0/None disables |
-| `linear_branch` | `before_G` | `none` / `before_G` |
-| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 16, 64, 4, 256 | branch shape |
+| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 64, 128, 4, 1024 | branch shape |
 | `lin_base_heads` | none | set when a trained branch was widened: its first `lin_base_heads` heads keep their original half-lives and the other heads take the positions in between (`retention.branch_half_lives`). Omitted from `config.json` when none |
-| `lin_half_life_range`, `lin_gate_init`, `lin_head_gate` | (256, 32768), 0.05, true | branch decay and gating |
-| `rms_norm_eps`, `rope_theta` | 1e-5, 10000 | |
-| `max_position_embeddings` | 65536 | not enforced; rotary has no table |
+| `lin_half_life_range`, `lin_gate_init`, `lin_head_gate` | (1024, 262144), 0.05, true | branch decay and gating |
+| `rms_norm_eps`, `rope_theta` | 1e-5, 500000 | |
+| `max_position_embeddings` | 524288 | not enforced; rotary has no table |
 | `fp32_residual` | true | residual stream in fp32 |
 | `initializer_range` | 0.025 | |
 | `tie_word_embeddings` | true | the head always reuses the input tables |

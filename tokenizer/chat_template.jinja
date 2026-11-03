@@ -24,7 +24,7 @@
 {%- set content = content.split('</think>')[-1].lstrip('\n') -%}
 {%- endif -%}
 {{- '<|assistant|>\n' -}}
-{%- if loop.index0 > ns.last_user and reasoning -%}{{- '<think>\n' + reasoning.strip('\n') + '\n</think>\n\n' -}}{%- endif -%}
+{%- if loop.index0 > ns.last_user -%}{{- '<think>\n' + reasoning.strip('\n') + '\n</think>\n\n' -}}{%- endif -%}
 {{- content.lstrip('\n') -}}
 {%- for tool_call in message.get('tool_calls') or [] -%}
 {%- set fn = tool_call['function'] if tool_call['function'] is defined else tool_call -%}
@@ -41,6 +41,5 @@
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-{{- '<|assistant|>\n' -}}
-{%- if enable_thinking is defined and not enable_thinking -%}{{- '<think>\n\n</think>\n\n' -}}{%- endif -%}
+{{- '<|assistant|>\n<think>\n' -}}
 {%- endif -%}

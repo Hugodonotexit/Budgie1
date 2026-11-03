@@ -149,7 +149,7 @@
     },
     {
       "id": 16,
-      "content": "<reserved_13>",
+      "content": "<file_sep>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -158,7 +158,7 @@
     },
     {
       "id": 17,
-      "content": "<reserved_14>",
+      "content": "<repo_name>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -388,8 +388,8 @@
       "</tool_call>": 13,
       "<tool_response>": 14,
       "</tool_response>": 15,
-      "<reserved_13>": 16,
-      "<reserved_14>": 17,
+      "<file_sep>": 16,
+      "<repo_name>": 17,
       "<reserved_15>": 18,
       "<reserved_16>": 19,
       "<reserved_17>": 20,

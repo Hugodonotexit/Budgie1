@@ -14,19 +14,20 @@ VOCAB = 300
 # Small windows, so that the caches really do drop tokens within a short test sequence.
 TYPES = {
     "S": {"window": 6, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 2},
-    "D4": {"window": 4, "dilation": 3, "conv": 3, "rope": True, "kv_heads": 2},
-    "D8": {"window": 5, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
-    "D16": {"window": 7, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
-    "G": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4},
+    "D1-4": {"window": 4, "dilation": 3, "conv": 3, "rope": True, "kv_heads": 2},
+    "D4-16": {"window": 5, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
+    "D16-64": {"window": 7, "dilation": 2, "conv": 4, "rope": True, "kv_heads": 2},
+    "G_shared": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4},
 }
-BRANCH = dict(linear_branch="before_G", lin_heads=2, lin_head_dim=8, lin_conv_kernel=4, lin_chunk=8,
+BRANCH = dict(lin_heads=2, lin_head_dim=8, lin_conv_kernel=4, lin_chunk=8,
               lin_half_life_range=(4, 64), lin_gate_init=0.5, lin_head_gate=True)
 
 
 def tiny_config(branch=True, **kw):
     base = dict(vocab_size=VOCAB, hidden_size=32, num_attention_heads=4, head_dim=16, attention_types=TYPES, num_blocks=2,
-                intermediate_size=(48, 48, 48), adaptive_cutoffs=(20, 80), ngram_buckets=64, max_position_embeddings=512)
-    base.update(BRANCH if branch else dict(linear_branch="none"))
+                intermediate_size=(48, 48, 48), adaptive_cutoffs=(20, 80), ngram_buckets=64, max_position_embeddings=512,
+                block_pattern=("S", "D1-4", "S", "D4-16", "D16-64", "SUM", "G_shared") if branch else ("S", "D1-4", "S", "D4-16", "D16-64", "G_shared"))
+    base.update(BRANCH if branch else {})
     base.update(kw)
     return BudgieConfig(**base)
 
@@ -120,13 +121,13 @@ def test_retention_branch_off_adds_no_parameters():
     on, off = tiny_model(True), tiny_model(False)
     assert sum(p.numel() for p in on.parameters()) > sum(p.numel() for p in off.parameters())
     assert off.model.branches is None
-    assert "linear_branch" not in off.config.to_dict() and "lin_heads" not in off.config.to_dict()
-    assert BudgieConfig.from_dict({k: v for k, v in tiny_config(True).to_dict().items() if k != "linear_branch"}).linear_branch == "none"
+    assert "lin_heads" not in off.config.to_dict() and not off.config.has_branch and on.config.has_branch
+    assert BudgieConfig.from_dict({**tiny_config(True).to_dict(), "block_pattern": ["S", "D1-4", "S", "D4-16", "D16-64", "G_shared"]}).has_branch is False
 
 
 def test_default_kv_sharing_pairs_consecutive_blocks():
     cfg = tiny_config(num_blocks=4)
-    size = len(cfg.block_pattern)
+    size = len(cfg.layer_pattern)
     assert cfg.kv_owner(1 * size + 1) == 1  # block 2's D4 reads block 1's D4
     assert cfg.kv_owner(size + 0) is None   # S layers always compute their own
     assert cfg.kv_owner(size + 2) is None
@@ -142,7 +143,7 @@ def test_default_kv_sharing_pairs_consecutive_blocks():
     dict(adaptive_cutoffs=(80, 20)),
     dict(adaptive_cutoffs=(20, VOCAB)),
     dict(ngram_heads=3),
-    dict(linear_branch="sideways"),
+    dict(block_pattern=("S", "D1-4", "SUM")),
     dict(kv_share={0: 1}),
 ])
 def test_invalid_configs_are_rejected(kw):

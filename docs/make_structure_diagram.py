@@ -11,15 +11,14 @@ from xml.sax.saxutils import escape
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 cfg = json.loads((ROOT / "config.json").read_text())
 
-W, H = 1040, 1224
+_layers = [x for x in cfg["block_pattern"] if x != "SUM"]
+W, H = 1040, 1224 + (len(_layers) - 6) * 50 + (len(set(_layers)) - 5) * 34   # 1224 fitted 6 layers of 5 kinds
 INK, MUTED, BG, GRID = "#0f172a", "#475569", "#ffffff", "#e2e8f0"
-KIND = {  # fill, stroke
-    "S": ("#dbeafe", "#2563eb"),
-    "D4": ("#dcfce7", "#16a34a"),
-    "D8": ("#fef3c7", "#d97706"),
-    "D16": ("#cffafe", "#0891b2"),
-    "G": ("#fce7f3", "#db2777"),
-}
+PALETTE = [  # fill, stroke; one per layer kind, in order of first use
+    ("#dbeafe", "#2563eb"), ("#e0e7ff", "#4f46e5"), ("#dcfce7", "#16a34a"), ("#ecfccb", "#65a30d"), ("#fef3c7", "#d97706"),
+    ("#ffedd5", "#ea580c"), ("#cffafe", "#0891b2"), ("#ccfbf1", "#0d9488"), ("#fae8ff", "#c026d3"), ("#fce7f3", "#db2777"),
+]
+KIND = {kind: PALETTE[i % len(PALETTE)] for i, kind in enumerate(dict.fromkeys(_layers))}
 BRANCH = ("#ede9fe", "#7c3aed")
 PLAIN = ("#f1f5f9", "#64748b")
 FONT = "DejaVu Sans, Helvetica, Arial, sans-serif"
@@ -70,12 +69,12 @@ def k(n):
 
 # ---- numbers from config.json ------------------------------------------------------------------
 d = cfg["hidden_size"]
-pattern, blocks = cfg["block_pattern"], cfg["num_blocks"]
+pattern, blocks = [k for k in cfg["block_pattern"] if k != "SUM"], cfg["num_blocks"]
 types = cfg["attention_types"]
 heads, hdim = cfg["num_attention_heads"], cfg["head_dim"]
 ffn = cfg["intermediate_size"]
 cuts, div = cfg["adaptive_cutoffs"], cfg["adaptive_div"]
-branch_on = cfg.get("linear_branch", "none") != "none"
+branch_on = "SUM" in cfg["block_pattern"]
 reach = lambda t: None if types[t]["window"] is None else types[t]["window"] * types[t]["dilation"]
 shared = sorted({int(r) // len(pattern) + 1 for r in cfg["kv_share"]})
 reader_kinds = {pattern[int(r) % len(pattern)] for r in cfg["kv_share"]}   # kinds whose layers read another layer's K/V
@@ -109,24 +108,24 @@ by_end = BY + 36 + rows * (RH + GAP) + 6
 rect(BX, BY, BW, by_end - BY, ("#fafafa", "#94a3b8"), 12, dash=True)
 text(BX + 14, BY + 24, f"Block × {blocks}", 14, "bold", "start")
 text(BX + BW - 14, BY + 24, "same pattern, separate weights", 12, "normal", "end", MUTED)
-LX, LW = 174, 240
+LX, LW = 172, 254
 row_y = {}
 for i, kind in enumerate(pattern):
     y = BY + 36 + i * (RH + GAP)
     row_y[i] = y
     t = types[kind]
     desc = "global, no positions" if t["window"] is None else f"window {k(t['window'])}" + (f", stride {t['dilation']}" if t["dilation"] > 1 else "")
-    box(LX, y, LW, RH, [f"{kind}   {desc}"], KIND[kind], 13)
+    box(LX, y, LW, RH, [f"{kind}   {desc}"], KIND[kind], 12)
     if i:
         arrow(LX + LW / 2, row_y[i - 1] + RH, LX + LW / 2, y)
     tag = ("reach " + k(reach(kind))) if reach(kind) else "reach: all"
     text(LX + LW + 8, y + RH / 2 + 4, tag + (" · KV*" if kind in reader_kinds else ""), 11, "normal", "start", MUTED)
-g_first = pattern.index("G")
 if branch_on:
+    g_first = cfg["block_pattern"].index("SUM")   # the layer the branch's output is added in front of
     lh, lw = cfg["lin_heads"], cfg["lin_head_dim"]
-    last_local = g_first - 1   # the branch sits beside every layer between the block start and the G layer
-    branch_bottom = row_y[last_local] + RH // 2   # stops short of the G layer so the output arrow has room to turn
-    box(BX + 8, row_y[1], 100, branch_bottom - row_y[1], ["Retention", "branch", f"{lh} heads × {lw}", "fixed decay", "reset per doc"], BRANCH, 11.5)
+    last_local = g_first - 1   # the branch sits beside every layer between the block start and the SUM
+    branch_bottom = row_y[last_local] + RH // 2   # stops short of that layer so the output arrow has room to turn
+    box(BX + 8, row_y[1], 100, branch_bottom - row_y[1], ["Retention", "branch", f"{lh} heads", f"× {lw} dims", "fixed decay", "reset per doc"], BRANCH, 11.5)
     path(f"M{BX+58} {BY+30}V{row_y[1]}", BRANCH[1])
     path(f"M{BX+58} {branch_bottom}V{row_y[g_first]-8}H{LX-13}", BRANCH[1])
     plus(LX - 24, row_y[g_first] - 8)
@@ -172,7 +171,7 @@ for cx0, title, items in (
         if j:
             arrow(cx0 + col_w / 2, AY + 56 + (j - 1) * 38 + 30, cx0 + col_w / 2, AY + 56 + j * 38)
 sy = AY + 56 + 4 * 38 + 6
-box(PX + 2, sy, 434, 46, ["Scaled dot-product attention", "windowed / dilated / global, + a learned sink per head"], KIND["S"], 12.5)
+box(PX + 2, sy, 434, 46, ["Scaled dot-product attention", "windowed / dilated / global, + a learned sink per head"], PALETTE[0], 12.5)
 for cx0 in (PX + 2 + col_w / 2, PX + 224 + col_w / 2):
     arrow(cx0, AY + 56 + 3 * 38 + 30, cx0, sy)
 arrow(RCX, sy + 46, RCX, sy + 58)
@@ -203,7 +202,7 @@ text(PX + 438, FY + 22, f"{len(widths) - 1} matrices instead of 2", 12, "normal"
 for j, (label, sub) in enumerate(steps):
     y = FY + 36 + j * 34
     act = "dSiLU" in label or label == "SiLU"
-    box(RCX - 100, y, 200, 28, [label + (f"  ({sub})" if sub else "")], KIND["D4"] if act else PLAIN, 12.5)
+    box(RCX - 100, y, 200, 28, [label + (f"  ({sub})" if sub else "")], PALETTE[2] if act else PLAIN, 12.5)
     if j:
         arrow(RCX, y - 6, RCX, y)
 ffn_end = FY + fh

@@ -195,18 +195,21 @@ def branch_half_lives(config: BudgieConfig, block: int):
     One grid: head j of H sits at fraction (j + block / num_blocks) / H of the way (in log2) across
     `lin_half_life_range`, so the blocks, staggered, together cover the range more densely.
 
-    A widened branch (`lin_base_heads` = B < H, see grow_branch.py): heads 0..B-1 stay exactly where the
-    B-head grid put them, because their weights were trained for those decays. Head B + k, with
-    j = k % B and m = 1 + k // B, goes m / H past old head j (wrapping around the range), which makes the
-    union of the two sets one even grid of H points spaced 1/H apart."""
+    A widened branch (`config.lin_stages()` = [B, ..., H], see grow_branch.py): the B heads of the first
+    stage stay exactly where the B-head grid put them, because their weights were trained for those decays.
+    At each widening from P heads to N, head P + k, with j = k % P and m = 1 + k // P, goes m / N past
+    existing head j (wrapping around the range), so the union is one even grid of N points spaced 1/N apart."""
     lo, hi = config.lin_half_life_range
-    H, base, off = config.lin_heads, config.lin_base_heads or config.lin_heads, block / config.num_blocks
+    stages, off = config.lin_stages(), block / config.num_blocks
+    base = stages[0]
     log_lo, span = math.log2(lo), math.log2(hi) - math.log2(lo)
     out = [2.0 ** (log_lo + span * (j + off) / base) for j in range(base)]
-    for k in range(H - base):
-        j, m = k % base, 1 + k // base
-        frac = ((j + off) / base + m / H) % 1.0
-        out.append(2.0 ** (log_lo + span * frac))
+    frac = [(j + off) / base for j in range(base)]
+    for prev, n in zip(stages, stages[1:]):
+        for k in range(n - prev):
+            j, m = k % prev, 1 + k // prev
+            frac.append((frac[j] + m / n) % 1.0)
+            out.append(2.0 ** (log_lo + span * frac[-1]))
     return out
 
 
@@ -243,6 +246,22 @@ class RetentionBranch(GradientCheckpointingLayer):
         self._half_life_on = {}  # device -> tensor: building it from the list is a blocking host-to-device copy
         self.stats = None  # set when a caller turns on `record_stats`
         self.record_stats = False
+        self._head_mask = None      # see set_head_mask
+        self._head_mask_on = {}
+
+    def set_head_mask(self, mask):
+        """Multiply every head's output by mask[h] (a list of `lin_heads` floats, or None for no mask) before o_proj.
+        A zero silences a head completely: no output, and so no gradient for its q/k/v rows, o_proj columns,
+        gate row or gain. For experiments (config.BRANCH_ZERO_HEADS); not saved with the model."""
+        if mask is not None and len(mask) != self.heads:
+            raise ValueError(f"head mask has {len(mask)} entries for {self.heads} heads")
+        self._head_mask = None if mask is None else [float(m) for m in mask]
+        self._head_mask_on = {}
+
+    def _mask_at(self, device):
+        if device not in self._head_mask_on:
+            self._head_mask_on[device] = torch.tensor(self._head_mask, dtype=torch.float32, device=device)
+        return self._head_mask_on[device]
 
     @property
     def half_life(self):
@@ -294,6 +313,8 @@ class RetentionBranch(GradientCheckpointingLayer):
             y = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.eps) * gain.float()
         if self.head_gate is not None:
             y = y * torch.sigmoid(self._sub("head_gate", weights, u).float())[..., None]  # [B, T, H, 1]; per token, so nothing to cache
+        if self._head_mask is not None:
+            y = y * self._mask_at(y.device)[:, None]                                       # [H, 1] against [B, T, H, dk]
         if cache is not None:
             cache.update_recurrent_state(S, self.layer_idx, state_idx=0)
         out = g.float() * self._sub("o_proj", weights, y.reshape(B, T, H * dk).to(self.o_proj.weight.dtype)).float()

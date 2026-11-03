@@ -78,14 +78,12 @@ class BudgieModel(BudgiePreTrainedModel):
         self.rotary = RotaryEmbedding(config.head_dim, config.rope_theta)
         self.layers = nn.ModuleList([DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        # The retention branch of every block (config.linear_branch); no module at all when it is off.
+        # The retention branch of every block (a SUM in config.block_pattern); no module at all without one.
         self.branches = None
-        if config.linear_branch != "none":
-            if config.linear_branch != "before_G":
-                raise NotImplementedError(f"linear_branch={config.linear_branch!r} is not implemented yet (only 'before_G')")
-            self._g_pos = config.block_pattern.index("G")  # the first G layer of a block
-            size = len(config.block_pattern)
-            self.branches = nn.ModuleList([RetentionBranch(config, b, b * size + self._g_pos) for b in range(config.num_blocks)])
+        if config.has_branch:
+            self._sum_pos = config.branch_pos  # the layer of a block the branch's output is added in front of
+            size = len(config.layer_pattern)
+            self.branches = nn.ModuleList([RetentionBranch(config, b, b * size + self._sum_pos) for b in range(config.num_blocks)])
         # The layers whose K/V some later layer reads (config.kv_share): only these are kept while the stack runs.
         self._kv_last_reader = {}
         for j in range(config.num_hidden_layers):
@@ -116,6 +114,19 @@ class BudgieModel(BudgiePreTrainedModel):
             layer.set_offload(pool, compile_halves, chunk)
         if pool is not None:
             pool.clear()
+
+    def set_branch_head_mask(self, zero_first=0, mask=None):
+        """Silence retention-branch heads in every block (an experiment, not saved): the first `zero_first`
+        heads, or any per-head list `mask` of multipliers; (0, None) clears it. See RetentionBranch.set_head_mask."""
+        if self.branches is None:
+            if zero_first or mask is not None:
+                raise ValueError("this model has no retention branch")
+            return
+        for branch in self.branches:
+            if mask is None and zero_first:
+                branch.set_head_mask([0.0] * zero_first + [1.0] * (branch.heads - zero_first))
+            else:
+                branch.set_head_mask(mask)
 
     def get_input_embeddings(self):
         return self.embed.adaptive.tok[0]
@@ -168,7 +179,7 @@ class BudgieModel(BudgiePreTrainedModel):
             is_bos = (input_ids == cfg.bos_token_id) if input_ids is not None else torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
             doc_pos = document_positions(is_bos, cache.last_doc_pos if cache is not None else None, token_mask)
             self.branch_stats = []
-            block_size = len(cfg.block_pattern)
+            block_size = len(cfg.layer_pattern)
             segmented = cache is None and self.branch_segment is not None
             remote = self.branch_device if cache is None and not segmented and self.branch_device not in (None, x.device) else None
             if remote is not None:
@@ -185,7 +196,7 @@ class BudgieModel(BudgiePreTrainedModel):
                     branch.record_stats = self.record_branch_stats
                     if remote is not None:  # queued now, so the other GPU works through it during the local layers
                         pending = branch.forward_on(remote, block_input, doc_pos_remote, mask_remote)
-                if pos == self._g_pos:  # the branch reads the stream from the start of the block and writes just before G
+                if pos == self._sum_pos:  # the branch reads the stream from the start of the block and is summed in at the SUM
                     if segmented and token_mask is None:
                         pool = self.offload_pool if torch.is_grad_enabled() else None
                         out = branch.forward_segmented(block_input, doc_pos, self.branch_segment, pool).to(x.dtype)

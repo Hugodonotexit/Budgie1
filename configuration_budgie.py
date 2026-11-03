@@ -7,28 +7,37 @@ from transformers import PretrainedConfig
 # its reach is window * dilation. conv: kernel of the depthwise causal convs in front of Q and K/V.
 # rope: rotary positions (False = none). kv_heads: key/value heads shared by the query heads.
 DEFAULT_ATTENTION_TYPES = {
-    "S": {"window": 4096, "dilation": 1, "conv": 3, "rope": True, "kv_heads": 8},   # local, reach 4k
-    "D4": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 16k
-    "D8": {"window": 8192, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},  # dilated, reach 32k
-    "D16": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},  # dilated, reach 64k
-    "G": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 8},  # global, no positions
+    "N": {"window": 1024, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 16},   # local, reach 1k
+    "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 8},   # local, reach 2k
+    "D1-2": {"window": 1024, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 8},   # dilated local, reach 2k
+    "D1-4": {"window": 1024, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},   # dilated local, reach 4k
+    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},   # dilated mid, reach 16k
+    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 64k
+    "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated long, reach 256k
+    "D128-256": {"window": 131072, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 2},   # dilated long, reach 256k
+    "G_shared": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 2},  # global, no positions
+    "G": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 1} # global, no positions
 }
-DEFAULT_PATTERN = ("S", "D4", "S", "D8", "D16", "G")
+
+# "SUM" is not a layer: it marks where the retention branch's output is added back to the residual stream. The branch
+# reads the stream at the start of the block and, with a SUM in the pattern, exists in every block. No SUM = no branch.
+BRANCH_SUM = "SUM"
+DEFAULT_PATTERN = ("N", "S", "D1-4", "D1-2", "D4-16", "D1-2", "D16-64", "S", BRANCH_SUM, "D64-256", "D128-256", "G_shared", "G")
 # One multiplier per n-gram hash head. The heads must differ in their multiplier, not just a seed:
 # a seed only shifts every hash by a constant, so n-grams that collide under one head would collide
 # under all of them.
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
-SHARED_KINDS = ("D4", "D8", "D16", "G")
-LINEAR_BRANCH_MODES = ("none", "before_G", "after_G")
+SHARED_KINDS = ("D1-4", "D4-16", "D16-64", "D64-256", "D128-256", "G_shared")
 LINEAR_BRANCH_KEYS = ("lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
-                      "lin_base_heads")
+                      "lin_base_heads", "lin_head_stages")
 
 
 class BudgieConfig(PretrainedConfig):
     """Decoder-only transformer built from repeated blocks of attention layers.
 
-    Depth: `block_pattern` (one letter per layer, keys of `attention_types`) repeated
-    `num_blocks` times. num_hidden_layers is derived from those two and cannot be set.
+    Depth: `block_pattern` (one entry per layer, keys of `attention_types`, plus at most one "SUM") repeated
+    `num_blocks` times. "SUM" is not a layer, only the place where the retention branch is added back (below).
+    num_hidden_layers (the entries other than SUM, times num_blocks) is derived and cannot be set.
 
     Every layer is  x += attn(norm(x))  then  x += ffn(norm(x)).
     Attention: Q reads a depthwise causal conv of norm(x), K/V read a second one; QK-norm; a learned
@@ -61,18 +70,21 @@ class BudgieConfig(PretrainedConfig):
     at `logit_softcap`. `adaptive_cutoffs=[]` makes it an ordinary full softmax.
     The frequency order is a buffer of the model (`embed.rank_of`), identity until set.
 
-    Optional retention branch (`linear_branch`; "none" turns it off; see retention.py). "before_G" runs a
+    Optional retention branch (see retention.py), on when `block_pattern` has a "SUM". It is a
     small fixed-decay linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives
-    spread log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) on each block's
-    input, in parallel with the local layers, and adds its gated output to the residual stream just
-    before the block's first G layer. It resets at every document start (a `bos_token_id` token).
+    spread log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) that reads each block's
+    input, in parallel with the local layers, and adds its gated output to the residual stream at the
+    SUM, i.e. just before the layer that follows it (so SUM cannot be last). It resets at every document
+    start (a `bos_token_id` token).
     `lin_head_gate` adds a per-token, per-head sigmoid gate on the branch's head outputs.
     `lin_base_heads` is set when a trained branch was widened (grow_branch.py): its first `lin_base_heads`
     heads keep the half-lives they were trained with, and the other heads take the positions in between
     (see retention.branch_half_lives). None (not written to config.json) = every head is on one grid.
-    Turned off, the model has no extra modules or parameters, and the `lin_*` fields are not written
-    to config.json, and a config.json without `linear_branch` (written before the branch existed, or
-    with it off) loads as "none" whatever the default above is.
+    A branch widened twice records every size in `lin_head_stages` (e.g. [4, 16, 32]); each stage's new heads
+    go halfway between the heads that already exist, and `lin_base_heads` is then the first entry.
+    Turned off (no SUM), the model has no extra modules or parameters and the `lin_*` fields are not
+    written to config.json. A config.json from before SUM existed has `linear_branch`: "before_G" loads
+    with a SUM put before the block's first G layer, "none" or no key loads without one.
     """
 
     model_type = "budgie"
@@ -100,18 +112,18 @@ class BudgieConfig(PretrainedConfig):
         adaptive_cutoffs=(2048, 8192),
         adaptive_div=2,
         logit_softcap=50.0,
-        linear_branch="before_G",
-        lin_heads=16,
-        lin_head_dim=64,
+        lin_heads=64,
+        lin_head_dim=128,
         lin_conv_kernel=4,
-        lin_chunk=256,
-        lin_half_life_range=(256, 32768),
+        lin_chunk=1024,
+        lin_half_life_range=(1024, 262144),
         lin_gate_init=0.05,
         lin_head_gate=True,
         lin_base_heads=None,
+        lin_head_stages=None,
         rms_norm_eps=1e-5,
-        rope_theta=10000.0,
-        max_position_embeddings=65536,
+        rope_theta=500000.0,
+        max_position_embeddings=524288,
         initializer_range=0.025,
         fp32_residual=True,
         use_cache=True,
@@ -125,9 +137,11 @@ class BudgieConfig(PretrainedConfig):
         self.block_pattern = list(block_pattern)
         self.num_blocks = int(num_blocks)
         self.attention_types = {k: dict(v) for k, v in (attention_types or DEFAULT_ATTENTION_TYPES).items()}
-        unknown = sorted(set(self.block_pattern) - set(self.attention_types))
+        unknown = sorted(set(self.layer_pattern) - set(self.attention_types))
         if unknown:
             raise ValueError(f"block_pattern uses {unknown}, which are not in attention_types {sorted(self.attention_types)}")
+        if self.block_pattern.count(BRANCH_SUM) > 1 or self.block_pattern[-1:] == [BRANCH_SUM]:
+            raise ValueError(f"block_pattern may have one {BRANCH_SUM!r}, followed by a layer in the same block, got {self.block_pattern}")
         for kind, spec in self.attention_types.items():
             if spec["window"] is not None and spec["window"] < 2:
                 raise ValueError(f"attention type {kind}: window must be >= 2 or None, got {spec['window']}")
@@ -135,7 +149,7 @@ class BudgieConfig(PretrainedConfig):
                 raise ValueError(f"attention type {kind}: need dilation >= 1 and conv >= 2, got {spec}")
             if num_attention_heads % spec["kv_heads"]:
                 raise ValueError(f"attention type {kind}: {num_attention_heads} heads not divisible by kv_heads {spec['kv_heads']}")
-        self.num_hidden_layers = len(self.block_pattern) * self.num_blocks
+        self.num_hidden_layers = len(self.layer_pattern) * self.num_blocks
 
         if isinstance(intermediate_size, (list, tuple)):
             intermediate_size = [list(map(int, w)) if isinstance(w, (list, tuple)) else int(w) for w in intermediate_size]
@@ -178,17 +192,19 @@ class BudgieConfig(PretrainedConfig):
             width = hidden_size // adaptive_div**i
             if width < 1:
                 raise ValueError(f"adaptive cluster {i} would have width {width}; it must be >= 1")
-        self.linear_branch = linear_branch
         self.lin_heads, self.lin_head_dim = int(lin_heads), int(lin_head_dim)
         self.lin_conv_kernel, self.lin_chunk = int(lin_conv_kernel), int(lin_chunk)
         self.lin_half_life_range = [float(lin_half_life_range[0]), float(lin_half_life_range[1])]
         self.lin_gate_init, self.lin_head_gate = float(lin_gate_init), bool(lin_head_gate)
         self.lin_base_heads = None if lin_base_heads is None else int(lin_base_heads)
-        if linear_branch not in LINEAR_BRANCH_MODES:
-            raise ValueError(f"linear_branch must be one of {LINEAR_BRANCH_MODES}, got {linear_branch!r}")
-        if linear_branch != "none":
-            if "G" not in self.block_pattern:
-                raise ValueError(f"linear_branch={linear_branch!r} needs a 'G' layer in block_pattern, got {self.block_pattern}")
+        stages = None if not lin_head_stages else [int(n) for n in lin_head_stages]
+        given_stages = stages                                  # as written, for the check below
+        if stages is not None and len(stages) == 2 and self.lin_base_heads in (None, stages[0]):
+            self.lin_base_heads, stages = stages[0], None          # one widening: the older, shorter spelling
+        self.lin_head_stages = stages
+        if stages is not None:
+            self.lin_base_heads = stages[0]
+        if self.has_branch:
             if self.lin_head_dim < 1:
                 raise ValueError(f"lin_head_dim must be >= 1, got {self.lin_head_dim}")
             lo, hi = self.lin_half_life_range
@@ -197,6 +213,10 @@ class BudgieConfig(PretrainedConfig):
             base = self.lin_base_heads
             if base is not None and not (1 <= base <= self.lin_heads and self.lin_heads % base == 0):
                 raise ValueError(f"lin_base_heads must divide lin_heads ({self.lin_heads}), got {base}")
+            if given_stages is not None and not (given_stages[-1] == self.lin_heads and given_stages[0] >= 1
+                                                 and all(a < b and b % a == 0 for a, b in zip(given_stages, given_stages[1:]))):
+                raise ValueError(f"lin_head_stages must increase, each a multiple of the one before, and end at lin_heads "
+                                 f"({self.lin_heads}), got {given_stages}")
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -226,29 +246,55 @@ class BudgieConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-        self.num_hidden_layers = len(self.block_pattern) * self.num_blocks
+        self.num_hidden_layers = len(self.layer_pattern) * self.num_blocks
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
-        if "linear_branch" not in config_dict:  # a saved config without the key has no branch
-            config_dict = {**config_dict, "linear_branch": "none"}
+        config_dict = dict(config_dict)
+        old = config_dict.pop("linear_branch", "none")   # written before SUM: the branch sat before the block's first G
+        pattern = list(config_dict.get("block_pattern", DEFAULT_PATTERN))
+        if old == "before_G" and BRANCH_SUM not in pattern and "G" in pattern:
+            pattern.insert(pattern.index("G"), BRANCH_SUM)
+            config_dict["block_pattern"] = pattern
         return super().from_dict(config_dict, **kwargs)
 
     def to_dict(self):
         """With the retention branch off, the branch fields are left out, so an old config.json and a
         newly saved one are identical."""
         d = super().to_dict()
-        if self.linear_branch == "none":
-            d.pop("linear_branch", None)
+        if not self.has_branch:
             for key in LINEAR_BRANCH_KEYS:
                 d.pop(key, None)
-        elif d.get("lin_base_heads") is None:
-            d.pop("lin_base_heads", None)   # a branch that was never widened writes the same config.json as before
+        else:
+            for key in ("lin_base_heads", "lin_head_stages"):
+                if d.get(key) is None:
+                    d.pop(key, None)        # a branch that was never widened writes the same config.json as before
         return d
+
+    def lin_stages(self):
+        """The branch's head counts over its life, e.g. [4, 16, 32]: the first is the grid it was built on,
+        each later one a widening (see retention.branch_half_lives). [lin_heads] if it was never widened."""
+        if self.lin_head_stages:
+            return list(self.lin_head_stages)
+        return [self.lin_base_heads, self.lin_heads] if self.lin_base_heads not in (None, self.lin_heads) else [self.lin_heads]
+
+    @property
+    def layer_pattern(self):
+        """block_pattern without the SUM: one entry per layer of a block."""
+        return [k for k in self.block_pattern if k != BRANCH_SUM]
+
+    @property
+    def has_branch(self):
+        return BRANCH_SUM in self.block_pattern
+
+    @property
+    def branch_pos(self):
+        """Index in a block of the layer the branch's output is added in front of; None without a branch."""
+        return self.block_pattern.index(BRANCH_SUM) if self.has_branch else None
 
     @property
     def layer_kinds(self):
-        return self.block_pattern * self.num_blocks
+        return self.layer_pattern * self.num_blocks
 
     def layer_spec(self, i):
         return self.attention_types[self.layer_kinds[i]]
@@ -259,9 +305,9 @@ class BudgieConfig(PretrainedConfig):
 
     def _default_kv_share(self):
         """Odd-numbered blocks (2nd, 4th, ...) read the D4 / D8 / D16 / G layers of the block before them."""
-        size, share = len(self.block_pattern), {}
+        size, share = len(self.layer_pattern), {}
         for block in range(1, self.num_blocks, 2):
-            for pos, kind in enumerate(self.block_pattern):
+            for pos, kind in enumerate(self.layer_pattern):
                 if kind in SHARED_KINDS:
                     share[block * size + pos] = (block - 1) * size + pos
         return share
@@ -276,7 +322,7 @@ class BudgieConfig(PretrainedConfig):
             return [list(w)] * self.num_hidden_layers
         if len(w) == self.num_hidden_layers:
             return [list(s) for s in w]
-        return [list(s) for s in w for _ in self.block_pattern]  # one per block
+        return [list(s) for s in w for _ in self.layer_pattern]  # one per block
 
     @property
     def adaptive_cuts(self):

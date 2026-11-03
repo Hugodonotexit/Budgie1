@@ -10,8 +10,8 @@
     "<fim_prefix>",
     "<fim_suffix>",
     "<fim_middle>",
-    "<reserved_13>",
-    "<reserved_14>",
+    "<file_sep>",
+    "<repo_name>",
     "<reserved_15>",
     "<reserved_16>",
     "<reserved_17>",
@@ -27,7 +27,7 @@
     "<reserved_27>",
     "<reserved_28>"
   ],
-  "model_max_length": 65536,
+  "model_max_length": 524288,
   "pad_token": "<pad>",
   "tokenizer_class": "TokenizersBackend"
 }

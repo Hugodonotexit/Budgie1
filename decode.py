@@ -133,7 +133,7 @@ class FastDecoder:
         doc_pos = None
         if m.branches is not None:
             doc_pos = document_positions(ids == cfg.bos_token_id, self.last_doc_pos, None)
-            block_size = len(cfg.block_pattern)
+            block_size = len(cfg.layer_pattern)
 
         shared = {}
         for i, layer in enumerate(m.layers):
@@ -141,7 +141,7 @@ class FastDecoder:
                 block, p = divmod(i, block_size)
                 if p == 0:
                     block_input = x
-                if p == m._g_pos:
+                if p == m._sum_pos:
                     x = x + m.branches[block](block_input, cache, doc_pos, None).to(x.dtype)
             owner = cfg.kv_owner(i)
             a = self._attention(layer.self_attn, i, layer.attn_norm(x), cos_sin, shared, owner)

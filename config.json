@@ -6,40 +6,75 @@
   "adaptive_div": 2,
   "attention_sinks": true,
   "attention_types": {
-    "D16": {
+    "D1-2": {
+      "conv": 2,
+      "dilation": 2,
+      "kv_heads": 8,
+      "rope": true,
+      "window": 1024
+    },
+    "D1-4": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 8,
+      "rope": true,
+      "window": 1024
+    },
+    "D128-256": {
+      "conv": 2,
+      "dilation": 2,
+      "kv_heads": 2,
+      "rope": true,
+      "window": 131072
+    },
+    "D16-64": {
+      "conv": 4,
+      "dilation": 4,
+      "kv_heads": 4,
       "rope": true,
       "window": 16384
     },
-    "D4": {
+    "D4-16": {
       "conv": 4,
       "dilation": 4,
-      "kv_heads": 4,
+      "kv_heads": 8,
       "rope": true,
       "window": 4096
     },
-    "D8": {
+    "D64-256": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 4,
       "rope": true,
-      "window": 8192
+      "window": 65536
     },
     "G": {
-      "conv": 4,
+      "conv": 2,
       "dilation": 1,
-      "kv_heads": 8,
+      "kv_heads": 1,
       "rope": false,
       "window": null
     },
+    "G_shared": {
+      "conv": 2,
+      "dilation": 1,
+      "kv_heads": 2,
+      "rope": false,
+      "window": null
+    },
+    "N": {
+      "conv": 2,
+      "dilation": 1,
+      "kv_heads": 16,
+      "rope": true,
+      "window": 1024
+    },
     "S": {
-      "conv": 3,
+      "conv": 2,
       "dilation": 1,
       "kv_heads": 8,
       "rope": true,
-      "window": 4096
+      "window": 2048
     }
   },
   "auto_map": {
@@ -48,11 +83,18 @@
     "AutoModelForCausalLM": "modeling_budgie.BudgieForCausalLM"
   },
   "block_pattern": [
+    "N",
     "S",
-    "D4",
+    "D1-4",
+    "D1-2",
+    "D4-16",
+    "D1-2",
+    "D16-64",
     "S",
-    "D8",
-    "D16",
+    "SUM",
+    "D64-256",
+    "D128-256",
+    "G_shared",
     "G"
   ],
   "bos_token_id": 1,
@@ -69,36 +111,43 @@
     2048
   ],
   "kv_share": {
-    "7": 1,
-    "9": 3,
-    "10": 4,
-    "11": 5,
-    "19": 13,
-    "21": 15,
-    "22": 16,
-    "23": 17,
-    "31": 25,
-    "33": 27,
-    "34": 28,
-    "35": 29,
-    "43": 37,
-    "45": 39,
-    "46": 40,
-    "47": 41
+    "14": 2,
+    "16": 4,
+    "18": 6,
+    "20": 8,
+    "21": 9,
+    "22": 10,
+    "38": 26,
+    "40": 28,
+    "42": 30,
+    "44": 32,
+    "45": 33,
+    "46": 34,
+    "62": 50,
+    "64": 52,
+    "66": 54,
+    "68": 56,
+    "69": 57,
+    "70": 58,
+    "86": 74,
+    "88": 76,
+    "90": 78,
+    "92": 80,
+    "93": 81,
+    "94": 82
   },
-  "lin_chunk": 256,
+  "lin_chunk": 1024,
   "lin_conv_kernel": 4,
   "lin_gate_init": 0.05,
   "lin_half_life_range": [
-    256.0,
-    32768.0
+    1024.0,
+    262144.0
   ],
-  "lin_head_dim": 64,
+  "lin_head_dim": 128,
   "lin_head_gate": true,
-  "lin_heads": 16,
-  "linear_branch": "before_G",
+  "lin_heads": 64,
   "logit_softcap": 50.0,
-  "max_position_embeddings": 65536,
+  "max_position_embeddings": 524288,
   "model_type": "budgie",
   "ngram_buckets": 262144,
   "ngram_dim": 128,
@@ -109,11 +158,11 @@
   ],
   "num_attention_heads": 16,
   "num_blocks": 8,
-  "num_hidden_layers": 48,
+  "num_hidden_layers": 96,
   "pad_token_id": 0,
   "qk_norm": true,
   "rms_norm_eps": 1e-05,
-  "rope_theta": 10000.0,
+  "rope_theta": 500000.0,
   "tie_word_embeddings": true,
   "transformers_version": "5.15.0",
   "use_cache": true,
