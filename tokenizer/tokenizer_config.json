@@ -27,7 +27,7 @@
     "<reserved_27>",
     "<reserved_28>"
   ],
-  "model_max_length": 524288,
+  "model_max_length": 1048576,
   "pad_token": "<pad>",
   "tokenizer_class": "TokenizersBackend"
 }

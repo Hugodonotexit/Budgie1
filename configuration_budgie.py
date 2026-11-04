@@ -6,29 +6,28 @@ from transformers import PretrainedConfig
 # prefix. dilation: the window is taken at stride `dilation` (token i sees i, i-d, i-2d, ...), so
 # its reach is window * dilation. conv: kernel of the depthwise causal convs in front of Q and K/V.
 # rope: rotary positions (False = none). kv_heads: key/value heads shared by the query heads.
+# 2026-11-04: 7 layers per block at hidden 1536 / 12 heads, one global layer per block (was 12 layers at 1024 / 16 heads
+# with N, D1-2, D128-256 and a second global kind G; configs saved before carry their own attention_types).
 DEFAULT_ATTENTION_TYPES = {
-    "N": {"window": 1024, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 16},   # local, reach 1k
-    "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 8},   # local, reach 2k
-    "D1-2": {"window": 1024, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 8},   # dilated local, reach 2k
-    "D1-4": {"window": 1024, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},   # dilated local, reach 4k
-    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 8},   # dilated mid, reach 16k
-    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 64k
-    "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated long, reach 256k
-    "D128-256": {"window": 131072, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 2},   # dilated long, reach 256k
-    "G_shared": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 2},  # global, no positions
-    "G": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 1} # global, no positions
+    "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 6},   # local, reach 2k
+    "D1-4": {"window": 1024, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated local, reach 4k
+    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 16k
+    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated mid, reach 64k
+    "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated long, reach 256k
+    "G_shared": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4},  # global, no positions
 }
 
 # "SUM" is not a layer: it marks where the retention branch's output is added back to the residual stream. The branch
 # reads the stream at the start of the block and, with a SUM in the pattern, exists in every block. No SUM = no branch.
 BRANCH_SUM = "SUM"
-DEFAULT_PATTERN = ("N", "S", "D1-4", "D1-2", "D4-16", "D1-2", "D16-64", "S", BRANCH_SUM, "D64-256", "D128-256", "G_shared", "G")
+DEFAULT_PATTERN = ("S", "D1-4", "D4-16", "S", "D16-64", BRANCH_SUM, "D64-256", "G_shared")
 # One multiplier per n-gram hash head. The heads must differ in their multiplier, not just a seed:
 # a seed only shifts every hash by a constant, so n-grams that collide under one head would collide
 # under all of them.
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
-SHARED_KINDS = ("D1-4", "D4-16", "D16-64", "D64-256", "D128-256", "G_shared")
-LINEAR_BRANCH_KEYS = ("lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
+SHARED_KINDS = ("D1-4", "D4-16", "D16-64", "D64-256", "G_shared")
+LIN_RULES = ("retention", "gated_delta")
+LINEAR_BRANCH_KEYS = ("lin_rule", "lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
                       "lin_base_heads", "lin_head_stages")
 
 
@@ -55,7 +54,7 @@ class BudgieConfig(PretrainedConfig):
     `kv_share` maps a reader layer to the earlier owner layer of the same kind whose K/V it reuses
     (the reader keeps its own Q side and FFN, and has no K/V projection, K/V conv or K/V cache).
     The default shares between consecutive blocks: blocks 2, 4, ... read from blocks 1, 3, ... for the
-    D4, D8, D16 and G layers (every kind but S). Pass {} to turn sharing off.
+    dilated and G_shared layers (every default kind but S). Pass {} to turn sharing off.
 
     Input: tokens embedded with a frequency-sorted adaptive embedding (clusters split at
     `adaptive_cutoffs` in frequency rank, each `adaptive_div` times narrower than the last, projected
@@ -76,11 +75,17 @@ class BudgieConfig(PretrainedConfig):
     for every position below L, so it changes nothing inside the trained length.
 
     Optional retention branch (see retention.py), on when `block_pattern` has a "SUM". It is a
-    small fixed-decay linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives
-    spread log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) that reads each block's
+    small linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives spread
+    log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) that reads each block's
     input, in parallel with the local layers, and adds its gated output to the residual stream at the
     SUM, i.e. just before the layer that follows it (so SUM cannot be last). It resets at every document
     start (a `bos_token_id` token).
+    `lin_rule` is its state update. "retention": fixed decay per head, every token added in with the same
+    weight. "gated_delta" (Gated DeltaNet, Yang et al. 2025): before writing a token's value at its key, the
+    state's current value at that key is erased (the delta rule), with a per-token write strength beta and a
+    per-token decay that starts at the head's half-life and learns to shorten or lengthen it; less forgetful
+    at long range because a new fact replaces the old one at its key instead of piling on top of it.
+    A config.json written before `lin_rule` existed has a retention branch and loads as "retention".
     `lin_head_gate` adds a per-token, per-head sigmoid gate on the branch's head outputs.
     `lin_base_heads` is set when a trained branch was widened (grow_branch.py): its first `lin_base_heads`
     heads keep the half-lives they were trained with, and the other heads take the positions in between
@@ -98,12 +103,12 @@ class BudgieConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size=42000,
-        hidden_size=1024,
+        hidden_size=1536,
         block_pattern=DEFAULT_PATTERN,
         num_blocks=8,
-        intermediate_size=(2048, 2048, 2048),
+        intermediate_size=(2560, 2560, 2560),
         ffn_hidden_layers=3,
-        num_attention_heads=16,
+        num_attention_heads=12,
         head_dim=128,
         attention_types=None,
         kv_share=None,
@@ -114,14 +119,15 @@ class BudgieConfig(PretrainedConfig):
         ngram_buckets=262144,
         ngram_dim=None,
         ngram_heads=2,
-        adaptive_cutoffs=(2048, 8192),
+        adaptive_cutoffs=(16384,),
         adaptive_div=2,
         logit_softcap=50.0,
+        lin_rule="gated_delta",
         lin_heads=64,
         lin_head_dim=128,
         lin_conv_kernel=4,
-        lin_chunk=1024,
-        lin_half_life_range=(1024, 262144),
+        lin_chunk=512,
+        lin_half_life_range=(1024, 1048576),
         lin_gate_init=0.05,
         lin_head_gate=True,
         lin_base_heads=None,
@@ -130,7 +136,7 @@ class BudgieConfig(PretrainedConfig):
         rope_theta=500000.0,
         rope_extension=None,
         global_logit_scale=None,
-        max_position_embeddings=524288,
+        max_position_embeddings=1048576,
         initializer_range=0.025,
         fp32_residual=True,
         use_cache=True,
@@ -209,6 +215,9 @@ class BudgieConfig(PretrainedConfig):
         if stages is not None and len(stages) == 2 and self.lin_base_heads in (None, stages[0]):
             self.lin_base_heads, stages = stages[0], None          # one widening: the older, shorter spelling
         self.lin_head_stages = stages
+        if lin_rule not in LIN_RULES:
+            raise ValueError(f"lin_rule must be one of {LIN_RULES}, got {lin_rule!r}")
+        self.lin_rule = lin_rule
         if stages is not None:
             self.lin_base_heads = stages[0]
         if self.has_branch:
@@ -276,6 +285,8 @@ class BudgieConfig(PretrainedConfig):
         if old == "before_G" and BRANCH_SUM not in pattern and "G" in pattern:
             pattern.insert(pattern.index("G"), BRANCH_SUM)
             config_dict["block_pattern"] = pattern
+        if BRANCH_SUM in config_dict.get("block_pattern", ()):
+            config_dict.setdefault("lin_rule", "retention")   # written before lin_rule existed: the fixed-decay branch
         return super().from_dict(config_dict, **kwargs)
 
     def to_dict(self):

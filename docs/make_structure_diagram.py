@@ -125,7 +125,9 @@ if branch_on:
     lh, lw = cfg["lin_heads"], cfg["lin_head_dim"]
     last_local = g_first - 1   # the branch sits beside every layer between the block start and the SUM
     branch_bottom = row_y[last_local] + RH // 2   # stops short of that layer so the output arrow has room to turn
-    box(BX + 8, row_y[1], 100, branch_bottom - row_y[1], ["Retention", "branch", f"{lh} heads", f"× {lw} dims", "fixed decay", "reset per doc"], BRANCH, 11.5)
+    gated = cfg.get("lin_rule", "retention") == "gated_delta"   # a config.json without lin_rule has the fixed-decay branch
+    rule = ["Gated", "DeltaNet"] if gated else ["Retention", "branch"]
+    box(BX + 8, row_y[1], 100, branch_bottom - row_y[1], rule + [f"{lh} heads", f"× {lw} dims", "learned decay" if gated else "fixed decay", "reset per doc"], BRANCH, 11.5)
     path(f"M{BX+58} {BY+30}V{row_y[1]}", BRANCH[1])
     path(f"M{BX+58} {branch_bottom}V{row_y[g_first]-8}H{LX-13}", BRANCH[1])
     plus(LX - 24, row_y[g_first] - 8)
@@ -162,8 +164,8 @@ text(PX + 6, AY + 22, "Attention", 14, "bold", "start")
 text(PX + 438, AY + 22, f"{heads} query heads × {hdim}", 12, "normal", "end", MUTED)
 col_w = 212
 for cx0, title, items in (
-    (PX + 2, "Q", ["causal conv (2–4 taps)", f"Wq", "QK-norm", "RoPE (not in G)"]),
-    (PX + 224, "K, V   (own layers only)", ["causal conv (own)", "Wk, Wv (grouped heads)", "QK-norm", "RoPE (not in G)"]),
+    (PX + 2, "Q", ["causal conv (2–4 taps)", f"Wq", "QK-norm", "RoPE (not in global)"]),
+    (PX + 224, "K, V   (own layers only)", ["causal conv (own)", "Wk, Wv (grouped heads)", "QK-norm", "RoPE (not in global)"]),
 ):
     text(cx0 + col_w / 2, AY + 46, title, 12.5, "bold", fill=MUTED)
     for j, label in enumerate(items):

@@ -66,6 +66,13 @@ class BudgiePreTrainedModel(PreTrainedModel):
                     module.g.fill_(self.config.lin_gate_init)
                 if not getattr(module.gain, "_is_hf_initialized", False):
                     module.gain.fill_(1.0)
+                if module.rule == "gated_delta":
+                    if not getattr(module.a_proj.weight, "_is_hf_initialized", False):
+                        module.a_proj.weight.zero_()        # decay starts exactly at the head's half-life
+                    if not getattr(module.dt_bias, "_is_hf_initialized", False):
+                        module.dt_bias.zero_()
+                    if not getattr(module.b_proj.bias, "_is_hf_initialized", False):
+                        module.b_proj.bias.zero_()          # write strength starts near 0.5
             elif isinstance(module, AdaptiveSoftmaxHead) and module.cluster_vectors is not None \
                     and not getattr(module.cluster_vectors, "_is_hf_initialized", False):
                 module.cluster_vectors.normal_(0.0, self.config.initializer_range)

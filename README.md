@@ -10,19 +10,19 @@ weights, training code or data. Trained models are published on Hugging Face, in
 **Budgie1.0-1B** collection of [Hugodonotexit](https://huggingface.co/Hugodonotexit). The collection does not
 exist yet; its link will be added here when it does.
 
-The default configuration (`BudgieConfig()`) is 8 blocks of 12 layers (96 layers), hidden size 1024, 16 heads of
-128 dims, **2.10 B parameters** (1.83 B with the retention branch off), vocabulary 42,000, positions up to 512k.
+The default configuration (`BudgieConfig()`) is 8 blocks of 7 layers (56 layers), hidden size 1536, 12 heads of
+128 dims, **2.06 B parameters** (1.65 B with the linear branch off), vocabulary 42,000, positions up to 1M.
 The model is trained by growing it one block at a time, so smaller depths matter too:
 
 | `num_blocks` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---|---|---|---|---|---|---|---|
-| parameters | 0.34 B | 0.59 B | 0.84 B | 1.09 B | 1.34 B | 1.59 B | 1.85 B | 2.10 B |
+| parameters | 0.39 B | 0.63 B | 0.87 B | 1.10 B | 1.34 B | 1.58 B | 1.82 B | 2.06 B |
 
 ![Budgie structure: the layer stack, one decoder layer, and the attention patterns](docs/structure.svg)
 
-> Status: the code, tokenizer and tests are working. The layout changed on 2026-11-03 (the 12-layer block below) and
-> training restarted from scratch; the Budgie1.0 models are not published yet. Until they are, the examples below
-> build a randomly initialised model.
+> Status: the code, tokenizer and tests are working. The layout changed on 2026-11-04 (wider and shallower, one global
+> layer per block, a Gated DeltaNet branch) before the restarted training produced a checkpoint; the Budgie1.0 models
+> are not published yet. Until they are, the examples below build a randomly initialised model.
 
 ## Install
 
@@ -109,7 +109,7 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
   dilation tokens, everything for global layers, nothing for layers that read another layer's K/V), plus the
   convolution states. `generate()` creates one for you.
 * **Single-token decoding runs as a CUDA graph.** On a GPU, `decode.py` replays one captured graph per generated
-  token (fixed-size ring buffers for K/V, conv and retention states updated in place) instead of launching
+  token (fixed-size ring buffers for K/V, conv and linear-branch states updated in place) instead of launching
   ~6000 small kernels, which makes decoding about 10x faster at 1k-4k tokens of context and about 7x at 16k.
   It is used for unpadded, `no_grad`, single-token steps; padded batches, beam search, `inputs_embeds` and CPU
   take the eager path, and the cache hands its state back whenever anything else needs it. Set
@@ -121,7 +121,7 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
   the `<bos>` that documents start with, and with it the context and continuation carry no `<eos>`. A `tokenizer.json`
   from before this change still ends every text with `<eos>`; delete the `<eos>` entries of its `post_processor`
   (`single` and `pair`) to match.
-* **Documents are separated by `<bos>`.** The retention branch resets its state at every `<bos>`.
+* **Documents are separated by `<bos>`.** The linear branch resets its state at every `<bos>`.
 
 ### Chat, thinking and tools
 
@@ -141,38 +141,43 @@ trained on the thinking and tool tokens yet.
 
 ## Architecture in short
 
-* **Layers.** A block is `N S D1-4 D1-2 D4-16 D1-2 D16-64 S SUM D64-256 D128-256 G_shared G`, repeated `num_blocks`
-  times (8 by default → 96 layers; `SUM` is not a layer). `N` and `S` are local attention (windows 1k and 2k); the
-  `D` layers are dilated, named by window and reach (`D16-64`: a 16k window at stride 4 reaching 64k back), up to
-  `D128-256`, which reaches 256k; `G_shared` and `G` are global attention without positional encoding. Every layer
-  is `x += attn(norm(x))` then `x += ffn(norm(x))`.
+* **Layers.** A block is `S D1-4 D4-16 S D16-64 SUM D64-256 G_shared`, repeated `num_blocks` times (8 by default →
+  56 layers; `SUM` is not a layer). `S` is local attention (a 2k window); the `D` layers are dilated, named by window
+  and reach (`D16-64`: a 16k window at stride 4 reaching 64k back), up to `D64-256`, which reaches 256k; `G_shared` is
+  global attention without positional encoding, one per block. Past 256k only the global layers and the linear branch
+  see anything, which keeps long contexts cheap: at 1M tokens a global layer averages 512k keys per query and a
+  windowed one at most 64k. Every layer is `x += attn(norm(x))` then `x += ffn(norm(x))`.
 * **Attention.** Grouped-query, with a depthwise causal convolution on Q and another on K/V, QK-norm, rotary
   positions (not in the global layers), and a learned sink logit per head. The rotary angles are computed in fp64 and
   reduced mod 2π, so they stay exact at 1M positions. Optional for long contexts: `rope_extension` (YaRN or linear
   position stretching) and `global_logit_scale` (a log-length query scale on the global layers past the trained length). Every second block (2nd, 4th, …) reuses the
-  K/V of the block before it in its `D1-4`, `D4-16`, `D16-64`, `D64-256`, `D128-256` and `G_shared` layers
-  (`kv_share`), which cuts the KV cache.
-* **FFN.** A causal convolution, then four matrices `d → 2048 → 2048 → 2048 → d`; SiLU after the first and last hidden
+  K/V of the block before it in its `D1-4`, `D4-16`, `D16-64`, `D64-256` and `G_shared` layers (`kv_share`), which
+  cuts the KV cache.
+* **FFN.** A causal convolution, then four matrices `d → 2560 → 2560 → 2560 → d`; SiLU after the first and last hidden
   layer and a centred dSiLU after the middle one.
-* **Embeddings.** A frequency-sorted adaptive embedding (clusters of width d, d/2, d/4) plus hashed 2- and 3-gram
-  tables with two independent hash heads each, projected up to the hidden size. The output head is an adaptive
+* **Embeddings.** A frequency-sorted adaptive embedding (the 16,384 most frequent tokens at width d, about 94% of
+  text; the rest at d/2) plus hashed 2- and 3-gram tables with two independent hash heads each, projected up to the
+  hidden size. The output head is an adaptive
   softmax tied to the same tables, with logits soft-capped at 50.
-* **Retention branch (on when `block_pattern` has a `SUM`).** A fixed-decay linear-attention branch per block (64 heads ×
-  128, half-lives 1k–262k tokens) that reads the block's input and writes a gated term into the residual stream at the
-  `SUM`, just before the layer that follows it. A pattern without `SUM` has no branch (no modules, and no `lin_*` keys
-  in `config.json`).
+* **Linear branch (on when `block_pattern` has a `SUM`).** A Gated DeltaNet branch per block (64 heads × 128) that reads
+  the block's input and writes a gated term into the residual stream at the `SUM`, just before the layer that follows
+  it. Its fixed-size state maps keys to values: writing a value at a key first erases what was stored there (the delta
+  rule), and a learned per-token decay and write strength decide what to keep. Decays start at half-lives spread over
+  1k–1M tokens. `lin_rule="retention"` gives the earlier fixed-decay branch, and a `config.json` without `lin_rule`
+  loads as that. A pattern without `SUM` has no branch (no modules, and no `lin_*` keys in `config.json`).
 
 [docs/architecture.md](docs/architecture.md) describes each part and every configuration field.
 
 ## Tests
 
 ```bash
-pytest tests                # CPU only, about 15 s
+pytest tests                # CPU only, about 20 s
 ```
 
 They cover shapes and log-probabilities, causality, cached decoding against a full forward pass, `generate`,
 configuration validation, `save_pretrained` → `from_pretrained` including loading in a fresh process with
-`trust_remote_code`, and the tokenizer, special tokens and chat template. `tests/test_decode.py` checks the
+`trust_remote_code`, the tokenizer, special tokens and chat template, and the Gated DeltaNet recurrence against its
+token-by-token fp64 reference (`tests/test_gated_delta.py`). `tests/test_decode.py` checks the
 CUDA-graph decode path against the eager one and is skipped when there is no GPU.
 
 ## Repository layout
@@ -184,7 +189,7 @@ CUDA-graph decode path against the eager one and is skipped when there is no GPU
 | `attention.py`, `patterns.py`, `sdpa.py` | attention layer, local / dilated / global patterns, SDPA with sinks |
 | `feedforward.py`, `activations.py`, `convolution.py` | FFN, centred dSiLU, causal convolution |
 | `embeddings.py`, `head.py` | adaptive + n-gram input, adaptive-softmax head |
-| `retention.py` | the retention branch |
+| `retention.py` | the linear branch: Gated DeltaNet and fixed-decay retention |
 | `cache.py` | `BudgieCache` |
 | `decode.py` | the CUDA-graph decode path (ring-buffer state, captured single-token step) |
 | `norms.py`, `rotary.py`, `decoder.py` | RMSNorm / QKNorm, rotary embeddings, decoder layer |

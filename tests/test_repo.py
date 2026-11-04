@@ -26,14 +26,16 @@ def test_config_json_loads_and_points_at_files_in_this_repo():
 
 def test_default_layer_structure():
     cfg = BudgieConfig()
-    assert cfg.block_pattern == ["N", "S", "D1-4", "D1-2", "D4-16", "D1-2", "D16-64", "S", "SUM", "D64-256", "D128-256", "G_shared", "G"]
-    assert cfg.num_hidden_layers == 96 and cfg.has_branch and cfg.branch_pos == 8 and cfg.layer_pattern[cfg.branch_pos] == "D64-256"
-    assert cfg.attention_types["D16-64"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4}
-    assert cfg.attention_types["D128-256"] == {"window": 131072, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 2}
-    assert cfg.attention_types["G"]["window"] is None and not cfg.attention_types["G"]["rope"]
+    assert cfg.block_pattern == ["S", "D1-4", "D4-16", "S", "D16-64", "SUM", "D64-256", "G_shared"]
+    assert cfg.num_hidden_layers == 56 and cfg.has_branch and cfg.branch_pos == 5 and cfg.layer_pattern[cfg.branch_pos] == "D64-256"
+    assert (cfg.hidden_size, cfg.num_attention_heads, cfg.head_dim) == (1536, 12, 128)
+    assert cfg.attention_types["S"]["kv_heads"] == 6 and cfg.lin_rule == "gated_delta" and cfg.adaptive_cutoffs == [16384]
+    assert cfg.attention_types["D16-64"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2}
+    assert cfg.attention_types["D64-256"] == {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2}
+    assert cfg.attention_types["G_shared"] == {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4}
     kinds = cfg.layer_kinds
     readers = {i for i in cfg.kv_share}
-    assert {kinds[i] for i in readers} == {"D1-4", "D4-16", "D16-64", "D64-256", "D128-256", "G_shared"}
+    assert {kinds[i] for i in readers} == {"D1-4", "D4-16", "D16-64", "D64-256", "G_shared"}
     assert json.loads((ROOT / "config.json").read_text())["block_pattern"] == cfg.block_pattern, "config.json is stale: regenerate it"
 
 
@@ -70,7 +72,7 @@ def test_plain_tokenization_is_bos_text_without_eos(tok):
 
 
 def test_model_max_length_matches_the_config(tok):
-    assert tok.model_max_length == BudgieConfig.from_pretrained(ROOT).max_position_embeddings == 524288
+    assert tok.model_max_length == BudgieConfig.from_pretrained(ROOT).max_position_embeddings == 1048576
     assert len(tok("word " * 3000)["input_ids"]) > 1024
 
 

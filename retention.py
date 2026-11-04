@@ -1,6 +1,10 @@
-"""A fixed-decay retention branch (RetNet-style linear attention) that runs in parallel with a block's
-local layers and writes one gated residual term just before the block's global layer.
+"""A linear-attention branch that runs in parallel with a block's local layers and writes one gated residual
+term just before the block's global layer. Two state updates (config.lin_rule):
 
+"gated_delta" (default for new models): Gated DeltaNet, see gated_delta_reference below; per-token decay and
+write strength, and the delta rule replaces the value stored at a key instead of adding to it.
+
+"retention" (configs written before lin_rule): fixed-decay RetNet-style retention.
 Per head, with decay lambda = ln2 / half_life and gamma = exp(-lambda) (fixed, not learned):
 
     S_t = gamma * S_{t-1} + (1 - gamma) * k_t v_t^T           fp32, zeroed at a document start
@@ -129,6 +133,109 @@ def retention_chunked(q, k, v, lam, doc_pos, S_init=None, chunk=64):
 
 
 # ---------------------------------------------------------------------------
+# Gated DeltaNet (lin_rule = "gated_delta")
+# ---------------------------------------------------------------------------
+#
+# Per head, with a per-token decay alpha_t = exp(-lam_t) and write strength beta_t in (0, 1):
+#
+#     S_t = alpha_t S_{t-1} + beta_t k_t (v_t - alpha_t S_{t-1}^T k_t)^T  =  alpha_t (I - beta_t k_t k_t^T) S_{t-1} + beta_t k_t v_t^T
+#     o_t = q_t^T S_t
+#
+# S [dk, dv] maps a key to a value. Writing v_t at k_t first removes what S already returns for k_t (the delta
+# rule), so a new value replaces the old one at that key instead of adding to it. With |k| = 1 and beta <= 1 every
+# step is a contraction plus a bounded write, so S stays bounded with no normalization.
+
+
+def gated_delta_reference(q, k, v, lam, beta, doc_pos, S_init=None):
+    """Token-by-token fp64 oracle. q, k: [B, T, H, dk]; v: [B, T, H, dv]; lam, beta: [B, T, H]; doc_pos: [B, T].
+    Returns (o [B, T, H, dv], S [B, H, dk, dv]). S is zeroed at every token with doc_pos == 1."""
+    q, k, v, lam, beta = (t.double() for t in (q, k, v, lam, beta))
+    B, T, H, dk = q.shape
+    S = torch.zeros(B, H, dk, v.shape[-1], dtype=torch.float64, device=q.device) if S_init is None else S_init.double().clone()
+    out = []
+    for t in range(T):
+        S = torch.where((doc_pos[:, t] == 1)[:, None, None, None], torch.zeros_like(S), S)
+        S = torch.exp(-lam[:, t])[..., None, None] * S
+        kt = k[:, t]
+        err = v[:, t] - torch.einsum("bhk,bhkv->bhv", kt, S)                             # what to write minus what is there
+        S = S + beta[:, t][..., None, None] * kt[..., :, None] * err[..., None, :]
+        out.append(torch.einsum("bhk,bhkv->bhv", q[:, t], S))
+    return torch.stack(out, 1), S
+
+
+def _gated_delta_chunk_terms(q, k, v, dp, lam, beta):
+    """Everything about a batch of chunks that does not depend on the state carried into it. q, k [B, n, L, H, dk],
+    v [B, n, L, H, dv], dp [B, n, L], lam and beta [B, n, L, H]. With c_i the within-chunk cumulative log decay
+    (Gamma_i = e^{c_i}) and r_ij = e^{c_i - c_j} for j <= i in the same document (0 otherwise), the per-token write
+    u_i = beta_i (v_i - Gamma_i k_i^T S_prev - sum_{j<i} r_ij (k_j . k_i) u_j) is a unit lower-triangular system
+    (I + A) U = beta V - beta Gamma K S_prev. Splitting it into U = Uv - W S_prev gives, all independent of S_prev:
+        O_intra [B, n, H, L, dv]    P Uv, with P_ij = r_ij (q_i . k_j)
+        Q_eff   [B, n, H, L, dk]    Gamma q - P W:  o = O_intra + Q_eff S_prev
+        M       [B, n, H, dk, dk]   Gamma_L I - K~^T W  and
+        N       [B, n, H, dk, dv]   K~^T Uv:  S_next = M S_prev + N, with K~_j = (Gamma_L / Gamma_j) k_j
+    Every exponent is <= 0. Gamma (on S_prev) is 0 for tokens outside the document carried into the chunk, and K~
+    covers only the chunk's last document, so a document start cuts the chain exactly as in the reference."""
+    L, dev, dt = q.shape[2], q.device, q.dtype
+    i = torch.arange(L, device=dev)
+    lag = i[:, None] - i[None, :]
+    same = (lag >= 0) & (lag < dp[..., :, None])                                         # j <= i and the same document, [B, n, L, L]
+    c = (-lam).cumsum(2).transpose(2, 3)                                                  # [B, n, H, L]
+    r = (c[..., :, None] - c[..., None, :]).masked_fill(~same[:, :, None], float("-inf")).exp()   # [B, n, H, L, L]
+    qT, kT, vT = q.transpose(2, 3), k.transpose(2, 3), v.transpose(2, 3)                  # [B, n, H, L, d]
+    bT = beta.transpose(2, 3)                                                             # [B, n, H, L]
+    A = (bT[..., :, None] * r * (kT @ kT.transpose(-1, -2))).tril(-1)                     # strictly below the diagonal
+    P = r * (qT @ kT.transpose(-1, -2))
+    cont = (dp > (i + 1))[:, :, None]                                                     # [B, n, 1, L]: in the carried document
+    gam = c.exp() * cont                                                                  # [B, n, H, L]
+    eye = torch.eye(L, device=dev, dtype=dt)
+    rhs = torch.cat([bT[..., None] * vT, (bT * gam)[..., None] * kT], -1)
+    X = torch.linalg.solve_triangular(A + eye, rhs, upper=False, unitriangular=True)
+    Uv, W = X.split([vT.shape[-1], kT.shape[-1]], -1)
+    O_intra = P @ Uv
+    Q_eff = gam[..., None] * qT - P @ W
+    in_last = ((L - 1 - i) < dp[..., L - 1:L])[:, :, None]                                # [B, n, 1, L]: in the chunk's last document
+    Kt = ((c[..., L - 1:] - c).exp() * in_last)[..., None] * kT                           # [B, n, H, L, dk]
+    a = (c[..., L - 1].exp() * cont[..., L - 1])[..., None, None]                         # [B, n, H, 1, 1]
+    M = a * torch.eye(kT.shape[-1], device=dev, dtype=dt) - Kt.transpose(-1, -2) @ W
+    N = Kt.transpose(-1, -2) @ Uv
+    return O_intra, Q_eff, M, N
+
+
+def _gated_delta_run_chunks(q, k, v, dp, lam, beta, S):
+    """Chunk terms for all n chunks at once, then the only sequential part, S_c = M_c S_{c-1} + N_c.
+    Returns (o [B, n*L, H, dv], S after the last chunk)."""
+    O_intra, Q_eff, M, N = _gated_delta_chunk_terms(q, k, v, dp, lam, beta)
+    prev = []
+    for c in range(M.shape[1]):
+        prev.append(S)
+        S = torch.baddbmm(N[:, c].flatten(0, 1), M[:, c].flatten(0, 1), S.flatten(0, 1)).view_as(S)
+    prev = torch.stack(prev, 1)                                                           # state entering each chunk, [B, n, H, dk, dv]
+    O = O_intra + Q_eff @ prev                                                            # [B, n, H, L, dv]
+    return O.transpose(2, 3).flatten(1, 2), S
+
+
+def gated_delta_chunked(q, k, v, lam, beta, doc_pos, S_init=None, chunk=64):
+    """The Gated DeltaNet recurrence `chunk` tokens at a time; same arguments and results as gated_delta_reference.
+    Within a chunk it solves one L x L unit-triangular system per head (the WY form of the delta rule), so the
+    cost and memory per chunk grow with chunk^2. As in retention_chunked, the `T % chunk` tokens left over form
+    one shorter chunk of their own."""
+    B, T, H, dk = q.shape
+    dv, dt = v.shape[-1], q.dtype
+    lam, beta = lam.to(dt), beta.to(dt)
+    S = torch.zeros(B, H, dk, dv, dtype=dt, device=q.device) if S_init is None else S_init.to(dt)
+    full = T // chunk * chunk
+    outs = []
+    for lo, hi, L in ((0, full, chunk), (full, T, T - full)):
+        if hi > lo:
+            n = (hi - lo) // L
+            o, S = _gated_delta_run_chunks(q[:, lo:hi].reshape(B, n, L, H, dk), k[:, lo:hi].reshape(B, n, L, H, dk),
+                                           v[:, lo:hi].reshape(B, n, L, H, dv), doc_pos[:, lo:hi].reshape(B, n, L),
+                                           lam[:, lo:hi].reshape(B, n, L, H), beta[:, lo:hi].reshape(B, n, L, H), S)
+            outs.append(o)
+    return torch.cat(outs, 1), S
+
+
+# ---------------------------------------------------------------------------
 # running the branch on another GPU
 # ---------------------------------------------------------------------------
 
@@ -237,6 +344,15 @@ class RetentionBranch(GradientCheckpointingLayer):
         self.v_proj = nn.Linear(d, H * dk, bias=False)
         self.o_proj = nn.Linear(H * dk, d, bias=False)
         self.head_gate = nn.Linear(d, H) if config.lin_head_gate else None
+        # Gated DeltaNet: per token and head, decay lam = lam_h * softplus(a_proj(u) + dt_bias) / ln2 (exactly the
+        # head's half-life lam_h while a_proj = 0 and dt_bias = 0, as initialized) and write strength
+        # beta = sigmoid(b_proj(u)). The half-life grid stays a fixed float per head, so the learned parameters
+        # sit near 0, where fp16 resolves small updates.
+        self.rule = config.lin_rule
+        if self.rule == "gated_delta":
+            self.a_proj = nn.Linear(d, H, bias=False)
+            self.b_proj = nn.Linear(d, H)
+            self.dt_bias = nn.Parameter(torch.zeros(H))
         self.gain = nn.Parameter(torch.ones(H, dk))
         self.g = nn.Parameter(torch.full((d,), config.lin_gate_init))
         # Fixed decay half-lives, log-uniform over lin_half_life_range and staggered by block so the blocks
@@ -309,7 +425,14 @@ class RetentionBranch(GradientCheckpointingLayer):
                 S_init = layer.recurrent_states[0]
         with torch.autocast(device_type=x0.device.type, enabled=False):
             q, k, v = F.normalize(q.float(), dim=-1, eps=1e-6), F.normalize(k.float(), dim=-1, eps=1e-6), v.float()
-            o, S = retention_chunked(q, k, v, math.log(2) / self._half_life_at(x0.device), doc_pos, S_init, self.chunk)
+            lam_h = math.log(2) / self._half_life_at(x0.device)
+            if self.rule == "gated_delta":
+                dt_bias = self.dt_bias if weights is None else weights["dt_bias"]
+                lam = lam_h * F.softplus(self._sub("a_proj", weights, u).float() + dt_bias.float()) / math.log(2)
+                beta = torch.sigmoid(self._sub("b_proj", weights, u).float())
+                o, S = gated_delta_chunked(q, k, v, lam, beta, doc_pos, S_init, self.chunk)
+            else:
+                o, S = retention_chunked(q, k, v, lam_h, doc_pos, S_init, self.chunk)
             y = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.eps) * gain.float()
         if self.head_gate is not None:
             y = y * torch.sigmoid(self._sub("head_gate", weights, u).float())[..., None]  # [B, T, H, 1]; per token, so nothing to cache

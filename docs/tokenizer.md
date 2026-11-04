@@ -29,7 +29,7 @@
   pair, `tok(a, b)` is `<bos> a b`). So a prompt can be continued as it is, and benchmark harnesses that tokenize
   with special tokens on (lm-evaluation-harness with `add_bos_token=True`) give every context and continuation a
   `<bos>` and no `<eos>`. Turning BOS off in a harness is not a substitute: the model expects `<bos>` at the start of
-  a document, and the retention branch resets its state there.
+  a document, and the linear branch resets its state there.
 * **A training document is `<bos> text <eos>`**, and the tokenizer no longer writes the `<eos>` for you: append
   `tok.eos_token_id` yourself (`tok(text)["input_ids"] + [tok.eos_token_id]`, or `[bos, *ids, eos]` from
   `add_special_tokens=False`).
