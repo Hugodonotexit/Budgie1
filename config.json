@@ -98,7 +98,7 @@
     "54": 47,
     "55": 48
   },
-  "lin_chunk": 512,
+  "lin_chunk": 128,
   "lin_conv_kernel": 4,
   "lin_gate_init": 0.05,
   "lin_half_life_range": [

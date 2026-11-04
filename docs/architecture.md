@@ -130,7 +130,7 @@ over `lin_half_life_range` (1024 … 1,048,576 tokens) and staggered from block 
 zero, so every head starts exactly at its half-life and learns to shorten or lengthen it. With |k| = 1 and β ≤ 1 each
 step is a contraction plus a bounded write, so the state needs no normalisation.
 
-`gated_delta_chunked` evaluates this `lin_chunk` (512) tokens at a time in the WY form: within a chunk the writes solve
+`gated_delta_chunked` evaluates this `lin_chunk` (128) tokens at a time in the WY form: within a chunk the writes solve
 one unit lower-triangular system per head (`torch.linalg.solve_triangular`), everything that does not depend on the
 incoming state is computed for all chunks at once, and only `S ← M S + N` (a `dk × dk` by `dk × dv` product per
 chunk) runs chunk after chunk. Cost and memory per chunk grow with `lin_chunk²`. `gated_delta_reference` is the
@@ -178,7 +178,7 @@ accepted.
 | `adaptive_cutoffs`, `adaptive_div` | (16384,), 2 | frequency clusters and width ratio; `[]` = full softmax |
 | `logit_softcap` | 50.0 | 0/None disables |
 | `lin_rule` | `"gated_delta"` | branch state update: `"gated_delta"` (Gated DeltaNet) or `"retention"` (fixed decay); `"retention"` when a `config.json` with a branch has no such key |
-| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 64, 128, 4, 512 | branch shape |
+| `lin_heads`, `lin_head_dim`, `lin_conv_kernel`, `lin_chunk` | 64, 128, 4, 128 | branch shape (`lin_chunk` 128: the least memory and time per token for Gated DeltaNet; chunk-terms memory grows with it) |
 | `lin_base_heads` | none | set when a trained branch was widened: its first `lin_base_heads` heads keep their original half-lives and the other heads take the positions in between (`retention.branch_half_lives`). Omitted from `config.json` when none |
 | `lin_half_life_range`, `lin_gate_init`, `lin_head_gate` | (1024, 1048576), 0.05, true | branch half-lives (the starting decays for `"gated_delta"`, fixed for `"retention"`) and gating |
 | `rms_norm_eps`, `rope_theta` | 1e-5, 500000 | |

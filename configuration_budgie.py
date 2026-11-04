@@ -126,7 +126,7 @@ class BudgieConfig(PretrainedConfig):
         lin_heads=64,
         lin_head_dim=128,
         lin_conv_kernel=4,
-        lin_chunk=512,
+        lin_chunk=128,
         lin_half_life_range=(1024, 1048576),
         lin_gate_init=0.05,
         lin_head_gate=True,
