@@ -85,7 +85,7 @@ print(config.num_hidden_layers, sum(p.numel() for p in model.parameters()) / 1e9
 
 ### Load a checkpoint
 
-Models in the [Budgie1.0-1B collection](https://huggingface.co/Hugodonotexit) (once it exists) are checkpoint
+Models in the [Budgie1.0 collection](https://huggingface.co/Hugodonotexit) are checkpoint
 directories: weights, `config.json`, the tokenizer and a copy of the code files, as written by `save_pretrained`.
 They load anywhere, without this repository installed:
 
