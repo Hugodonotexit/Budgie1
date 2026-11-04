@@ -305,8 +305,8 @@ def try_fast_decode(model, cache, input_ids, attention_mask):
         return None
     if not input_ids.is_cuda or torch.is_grad_enabled() or cache.no_fast:
         return None
-    if model.record_branch_stats or model.branch_device is not None:
-        return None
+    if model.record_branch_stats or model.branch_device is not None or getattr(model, "has_sparse_global", False):
+        return None   # compressed + selected layers keep a selection state the graph engine does not have
     eng = cache.fast_engine
     if eng is None:
         past = cache.get_seq_length()

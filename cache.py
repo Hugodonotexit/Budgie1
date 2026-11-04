@@ -39,6 +39,8 @@ class BudgieCache(Cache):
         super().__init__(layers=layers)
         self.last_ids = None
         self.last_doc_pos = None
+        # Compressed + selected layers (sparse.py): layer -> (query group, S of the group before it, partial S of it)
+        self.sparse_state = {}
         self.fast_engine = None  # the decode.FastDecoder currently holding this cache's state, if any
         self.no_fast = False     # set when this cache must stay on the eager path (padded batch, beam search...)
 
@@ -53,17 +55,23 @@ class BudgieCache(Cache):
             self.fast_engine.release()
         self.no_fast = True
 
+    def _map_sparse(self, fn):
+        self.sparse_state = {i: (g, fn(prev), fn(part)) for i, (g, prev, part) in self.sparse_state.items()}
+
     def crop(self, *args, **kwargs):
         self._leave_fast()
+        self.sparse_state = {}   # a selection state cannot be rolled back; a sparse layer refuses to continue
         return super().crop(*args, **kwargs)
 
-    def batch_repeat_interleave(self, *args, **kwargs):
+    def batch_repeat_interleave(self, repeats):
         self._leave_fast()
-        return super().batch_repeat_interleave(*args, **kwargs)
+        self._map_sparse(lambda t: t.repeat_interleave(repeats, dim=0))
+        return super().batch_repeat_interleave(repeats)
 
-    def batch_select_indices(self, *args, **kwargs):
+    def batch_select_indices(self, indices):
         self._leave_fast()
-        return super().batch_select_indices(*args, **kwargs)
+        self._map_sparse(lambda t: t[indices])
+        return super().batch_select_indices(indices)
 
     def reorder_cache(self, beam_idx):
         self._leave_fast()
@@ -72,3 +80,4 @@ class BudgieCache(Cache):
             self.last_ids = self.last_ids.index_select(0, beam_idx.to(self.last_ids.device))
         if self.last_doc_pos is not None:
             self.last_doc_pos = self.last_doc_pos.index_select(0, beam_idx.to(self.last_doc_pos.device))
+        self._map_sparse(lambda t: t.index_select(0, beam_idx.to(t.device)))

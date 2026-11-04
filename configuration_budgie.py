@@ -6,27 +6,30 @@ from transformers import PretrainedConfig
 # prefix. dilation: the window is taken at stride `dilation` (token i sees i, i-d, i-2d, ...), so
 # its reach is window * dilation. conv: kernel of the depthwise causal convs in front of Q and K/V.
 # rope: rotary positions (False = none). kv_heads: key/value heads shared by the query heads.
-# 2026-11-04: 7 layers per block at hidden 1536 / 12 heads, one global layer per block (was 12 layers at 1024 / 16 heads
+# 2026-11-04: 8 layers per block at hidden 1536 / 12 heads, one global layer per block (was 12 layers at 1024 / 16 heads
 # with N, D1-2, D128-256 and a second global kind G; configs saved before carry their own attention_types).
 DEFAULT_ATTENTION_TYPES = {
     "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 6},   # local, reach 2k
-    "D1-4": {"window": 1024, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated local, reach 4k
-    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 16k
-    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated mid, reach 64k
+    "D2-4": {"window": 2048, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 6},   # dilated local, reach 4k
+    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 6},   # dilated mid, reach 16k
+    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 64k
+    "D32-128": {"window": 32768, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated long, reach 128k
     "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated long, reach 256k
-    "G_shared": {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4},  # global, no positions
+    "G_shared": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 4},  # global, no positions
 }
 
 # "SUM" is not a layer: it marks where the retention branch's output is added back to the residual stream. The branch
 # reads the stream at the start of the block and, with a SUM in the pattern, exists in every block. No SUM = no branch.
 BRANCH_SUM = "SUM"
-DEFAULT_PATTERN = ("S", "D1-4", "D4-16", "S", "D16-64", BRANCH_SUM, "D64-256", "G_shared")
+DEFAULT_PATTERN = ("S", "D4-16", "D16-64", "D4-16", "D2-4", BRANCH_SUM, "D32-128", "D64-256", "G_shared")
 # One multiplier per n-gram hash head. The heads must differ in their multiplier, not just a seed:
 # a seed only shifts every hash by a constant, so n-grams that collide under one head would collide
 # under all of them.
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
-SHARED_KINDS = ("D1-4", "D4-16", "D16-64", "D64-256", "G_shared")
+SHARED_KINDS = ("D16-64", "D32-128", "D64-256", "G_shared")
 LIN_RULES = ("retention", "gated_delta")
+# Compressed + selected global attention (see sparse.py) in every `every`-th block's global layers (2: the 2nd, 4th, ...).
+DEFAULT_SPARSE_GLOBAL = {"every": 2, "compress": 64, "select": 16, "group": 16, "local": 128}
 LINEAR_BRANCH_KEYS = ("lin_rule", "lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
                       "lin_base_heads", "lin_head_stages")
 
@@ -54,7 +57,7 @@ class BudgieConfig(PretrainedConfig):
     `kv_share` maps a reader layer to the earlier owner layer of the same kind whose K/V it reuses
     (the reader keeps its own Q side and FFN, and has no K/V projection, K/V conv or K/V cache).
     The default shares between consecutive blocks: blocks 2, 4, ... read from blocks 1, 3, ... for the
-    dilated and G_shared layers (every default kind but S). Pass {} to turn sharing off.
+    layers whose kind is in SHARED_KINDS (by default the long dilated kinds and G_shared). Pass {} to turn sharing off.
 
     Input: tokens embedded with a frequency-sorted adaptive embedding (clusters split at
     `adaptive_cutoffs` in frequency rank, each `adaptive_div` times narrower than the last, projected
@@ -73,6 +76,13 @@ class BudgieConfig(PretrainedConfig):
     max(1, ln(p + 1) / ln(L)) at absolute position p, {"type": "log", "trained_length": L}: a softmax over more
     keys than training saw is sharpened back in proportion to log(keys) (Scalable-Softmax). It is exactly 1
     for every position below L, so it changes nothing inside the trained length.
+
+    `sparse_global` (None = off) turns the global layers of every `every`-th block (2: the 2nd, 4th, ...; with the
+    default kv_share these are the layers that read the block before's K/V) into compressed + selected attention
+    (sparse.py): each query sees the K/V pooled `compress` tokens at a time, the `select` blocks of `compress`
+    tokens that the previous `group` queries rated highest, and the last `local` tokens exactly, in one softmax.
+    At 1M tokens that is ~10k keys per query instead of ~512k. A config.json written before `sparse_global`
+    existed loads with it off.
 
     Optional retention branch (see retention.py), on when `block_pattern` has a "SUM". It is a
     small linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives spread
@@ -117,13 +127,13 @@ class BudgieConfig(PretrainedConfig):
         ffn_conv_kernel=4,
         ngram_orders=(2, 3),
         ngram_buckets=262144,
-        ngram_dim=None,
+        ngram_dim=128,
         ngram_heads=2,
-        adaptive_cutoffs=(16384,),
+        adaptive_cutoffs=(16384, 40000),
         adaptive_div=2,
         logit_softcap=50.0,
         lin_rule="gated_delta",
-        lin_heads=64,
+        lin_heads=32,
         lin_head_dim=128,
         lin_conv_kernel=4,
         lin_chunk=128,
@@ -136,6 +146,7 @@ class BudgieConfig(PretrainedConfig):
         rope_theta=500000.0,
         rope_extension=None,
         global_logit_scale=None,
+        sparse_global=DEFAULT_SPARSE_GLOBAL,
         max_position_embeddings=1048576,
         initializer_range=0.025,
         fp32_residual=True,
@@ -248,6 +259,14 @@ class BudgieConfig(PretrainedConfig):
                 raise ValueError(f"global_logit_scale needs type 'log' and trained_length >= 2, got {global_logit_scale}")
             global_logit_scale["trained_length"] = int(global_logit_scale["trained_length"])
         self.global_logit_scale = global_logit_scale
+        if sparse_global is not None:
+            sparse_global = {k: int(v) for k, v in dict(sparse_global).items()}
+            if set(sparse_global) != set(DEFAULT_SPARSE_GLOBAL):
+                raise ValueError(f"sparse_global needs exactly the keys {sorted(DEFAULT_SPARSE_GLOBAL)}, got {sorted(sparse_global)}")
+            sg = sparse_global
+            if sg["every"] < 1 or sg["compress"] < 2 or sg["select"] < 1 or sg["group"] < 1 or sg["local"] < sg["group"]:
+                raise ValueError(f"sparse_global needs every >= 1, compress >= 2, select >= 1, group >= 1 and local >= group, got {sg}")
+        self.sparse_global = sparse_global
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.fp32_residual = fp32_residual
@@ -287,13 +306,15 @@ class BudgieConfig(PretrainedConfig):
             config_dict["block_pattern"] = pattern
         if BRANCH_SUM in config_dict.get("block_pattern", ()):
             config_dict.setdefault("lin_rule", "retention")   # written before lin_rule existed: the fixed-decay branch
+        if "block_pattern" in config_dict:
+            config_dict.setdefault("sparse_global", None)      # a saved config from before sparse_global: every global layer dense
         return super().from_dict(config_dict, **kwargs)
 
     def to_dict(self):
         """With the retention branch off, the branch fields are left out, so an old config.json and a
         newly saved one are identical."""
         d = super().to_dict()
-        for key in ("rope_extension", "global_logit_scale"):
+        for key in ("rope_extension", "global_logit_scale", "sparse_global"):
             if d.get(key) is None:
                 d.pop(key, None)                    # unset: config.json stays as before the field existed
         if not self.has_branch:
@@ -332,6 +353,13 @@ class BudgieConfig(PretrainedConfig):
 
     def layer_spec(self, i):
         return self.attention_types[self.layer_kinds[i]]
+
+    def sparse_spec(self, i):
+        """The sparse_global settings if layer i is a compressed + selected global layer, else None."""
+        sg = getattr(self, "sparse_global", None)
+        if sg is None or self.layer_spec(i)["window"] is not None:
+            return None
+        return sg if (i // len(self.layer_pattern) + 1) % sg["every"] == 0 else None
 
     def kv_owner(self, i):
         """The layer whose K/V layer i reads, or None if layer i computes its own."""

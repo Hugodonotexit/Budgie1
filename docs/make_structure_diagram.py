@@ -134,6 +134,11 @@ if branch_on:
     text(BX + 8, row_y[g_first] + 18, "gated output", 11, "normal", "start", BRANCH[1])
 ft = by_end + 12
 text(BX, ft + 6, "*KV: " + ", ".join(map(str, shared)) + f" blocks reuse the K/V of the block before them", 11.5, "normal", "start", MUTED)
+sg = cfg.get("sparse_global")
+if sg:   # config.sparse_global: the global layers of every `every`-th block are compressed + selected
+    sparse_blocks = [b + 1 for b in range(blocks) if (b + 1) % sg["every"] == 0]
+    text(BX, ft + 22, "G_shared of blocks " + ", ".join(map(str, sparse_blocks)) + f": compressed ({sg['compress']}-token blocks)"
+         f" + top-{sg['select']} blocks + last {sg['local']}", 11.5, "normal", "start", MUTED)
 arrow(CX, by_end, CX, by_end + 52 + 8, head=True)  # to final norm
 box(CX - 80, by_end + 60, 160, 32, ["RMSNorm"], PLAIN, 13)
 arrow(CX, by_end + 92, CX, by_end + 120)

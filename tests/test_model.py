@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from budgie import BudgieCache, BudgieConfig, BudgieForCausalLM, BudgieModel
+from budgie.configuration_budgie import SHARED_KINDS
 
 BOS = 1
 VOCAB = 300
@@ -23,9 +24,14 @@ BRANCH = dict(lin_heads=2, lin_head_dim=8, lin_conv_kernel=4, lin_chunk=8,
               lin_half_life_range=(4, 64), lin_gate_init=0.5, lin_head_gate=True)
 
 
+# Small blocks, so the 2nd block's compressed + selected global layer really pools and selects in short sequences.
+SPARSE = {"every": 2, "compress": 4, "select": 2, "group": 3, "local": 5}
+
+
 def tiny_config(branch=True, **kw):
     base = dict(vocab_size=VOCAB, hidden_size=32, num_attention_heads=4, head_dim=16, attention_types=TYPES, num_blocks=2,
                 intermediate_size=(48, 48, 48), adaptive_cutoffs=(20, 80), ngram_buckets=64, max_position_embeddings=512,
+                sparse_global=SPARSE,
                 block_pattern=("S", "D1-4", "S", "D4-16", "D16-64", "SUM", "G_shared") if branch else ("S", "D1-4", "S", "D4-16", "D16-64", "G_shared"))
     base.update(BRANCH if branch else {})
     base.update(kw)
@@ -128,12 +134,12 @@ def test_retention_branch_off_adds_no_parameters():
 def test_default_kv_sharing_pairs_consecutive_blocks():
     cfg = tiny_config(num_blocks=4)
     size = len(cfg.layer_pattern)
-    assert cfg.kv_owner(1 * size + 1) == 1  # block 2's D4 reads block 1's D4
-    assert cfg.kv_owner(size + 0) is None   # S layers always compute their own
-    assert cfg.kv_owner(size + 2) is None
-    assert cfg.kv_owner(3 * size + 4) == 2 * size + 4  # D16
-    assert cfg.kv_owner(3 * size + 5) == 2 * size + 5  # G
-    assert sorted(cfg.kv_share) == [size + 1, size + 3, size + 4, size + 5, 3 * size + 1, 3 * size + 3, 3 * size + 4, 3 * size + 5]
+    shared = [p for p, kind in enumerate(cfg.layer_pattern) if kind in SHARED_KINDS]
+    assert shared == [4, 5]                 # D16-64, G_shared; S, D1-4 and D4-16 always compute their own
+    assert cfg.kv_owner(size + 4) == 4      # block 2's D16-64 reads block 1's
+    assert cfg.kv_owner(size + 0) is None and cfg.kv_owner(size + 3) is None
+    assert cfg.kv_owner(3 * size + 5) == 2 * size + 5  # G_shared
+    assert sorted(cfg.kv_share) == sorted(b * size + p for b in (1, 3) for p in shared)
     assert tiny_config(num_blocks=4, kv_share={}).kv_share == {}
 
 

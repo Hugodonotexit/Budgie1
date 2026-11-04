@@ -16,6 +16,10 @@ of a base of ~7.6 GiB. Here backward goes chunk by chunk, so that working set is
                        C  per chunk, recompute K/V with grad and push the dK, dV slice back -> dx, K/V-path
                           parameter gradients.
                      A layer that READS another layer's K/V (config.kv_share) skips A and C and returns dK, dV.
+                     A compressed + selected layer (sparse.py) also pools K/V once for the whole sequence; in B the
+                     pooled K/V are leaves too, and their gradient goes back through the pooling (by segments of
+                     whole blocks) before dK, dV are used. Its chunks also compute the `group` queries before them,
+                     which the first query group's block selection needs.
 
 Both go through _Staged, a custom autograd Function that holds its input in pinned host memory (offload.py).
 All of it is exact: the same operations on the same values, only grouped differently.
@@ -98,12 +102,19 @@ class FFNHalf:
         return dx, ()
 
 
+_POOL_SEGMENT = 1 << 16   # tokens of K/V pooled at once (sparse layers)
+
+
 class AttentionHalf:
     def __init__(self, layer, cos_sin, chunk):
         self.layer, self.cos_sin, self.chunk = layer, cos_sin, chunk
         attn = layer.self_attn
         self.owner = attn.owner
-        self.context_q = attn.q_conv.width - 1
+        self.sparse = attn.sparse
+        self.before = attn.sparse["group"] if attn.sparse is not None else 0
+        if self.before and chunk % self.before:
+            raise ValueError(f"a sparse layer's chunk ({chunk}) must be a multiple of its query group ({self.before})")
+        self.context_q = attn.q_conv.width - 1 + self.before
         self.context_kv = attn.kv_conv.width - 1 if attn.owner else 0
 
     def _positions(self, lo, e):
@@ -115,12 +126,17 @@ class AttentionHalf:
         k, v, _ = self.layer.self_attn._own_kv(self.layer.attn_norm(x_ext), self._positions(lo, lo + x_ext.shape[1]), None, None, 0)
         return k[:, :, s - lo:], v[:, :, s - lo:]
 
-    def _attend(self, x_ext, k, v, s, lo):
+    def _attend(self, x_ext, k, v, s, lo, pooled=None):
         attn = self.layer.self_attn
         e = lo + x_ext.shape[1]
-        q = attn._queries(self.layer.attn_norm(x_ext), self._positions(lo, e), None, None,
-                          attn.query_positions(lo, e - lo, x_ext.device))[:, :, s - lo:]
-        out = attn.pattern.attend_chunk(q, k, v, s, attn.sinks, attn.scale, attn.n_rep)
+        q_all = attn._queries(self.layer.attn_norm(x_ext), self._positions(lo, e), None, None,
+                              attn.query_positions(lo, e - lo, x_ext.device))
+        q = q_all[:, :, s - lo:]
+        if self.sparse is not None:
+            q_before = q_all[:, :, s - self.before - lo:s - lo] if s else None
+            out, _ = attn.attend_sparse(q, k[:, :, :e], v[:, :, :e], s, kc=pooled[0], vc=pooled[1], q_before=q_before)
+        else:
+            out = attn.pattern.attend_chunk(q, k, v, s, attn.sinks, attn.scale, attn.n_rep)
         return x_ext[:, s - lo:] + attn.o_proj(out.transpose(1, 2).reshape(x_ext.shape[0], e - s, -1))
 
     def _all_kv(self, x):
@@ -136,16 +152,41 @@ class AttentionHalf:
                 k[:, :, s:e], v[:, :, s:e] = kk, vv
         return k, v
 
+    def _pool(self, k, v):
+        """Pooled K/V of the whole sequence for a sparse layer, without grad, a segment of whole blocks at a time."""
+        m = self.sparse["compress"]
+        seg = max(m, _POOL_SEGMENT // m * m)
+        with torch.no_grad():
+            parts = [self.layer.self_attn.compress(k[:, :, a:a + seg], v[:, :, a:a + seg])[:2] for a in range(0, k.shape[2] // m * m, seg)]
+        if not parts:
+            empty = k.new_zeros(k.shape[0], k.shape[1], 0, k.shape[3], dtype=torch.promote_types(k.dtype, torch.float32))
+            return empty, empty.clone()
+        return torch.cat([p[0] for p in parts], 2), torch.cat([p[1] for p in parts], 2)
+
+    def _pool_backward(self, k, v, kc, vc):
+        """Send the pooled K/V's gradient back through the pooling into k.grad, v.grad and pool_score's gradient."""
+        if kc.grad is None and vc.grad is None:
+            return
+        m = self.sparse["compress"]
+        seg = max(m, _POOL_SEGMENT // m * m)
+        gk = kc.grad if kc.grad is not None else torch.zeros_like(kc)
+        gv = vc.grad if vc.grad is not None else torch.zeros_like(vc)
+        for a in range(0, kc.shape[2] * m, seg):
+            with torch.enable_grad():
+                pk, pv, _ = self.layer.self_attn.compress(k[:, :, a:a + seg], v[:, :, a:a + seg])
+            torch.autograd.backward([pk, pv], [gk[:, :, a // m:a // m + pk.shape[2]], gv[:, :, a // m:a // m + pv.shape[2]]])
+
     def forward(self, x, *shared):
         if self.owner:
             k, v = self._all_kv(x)
             k_pos = torch.arange(x.shape[1], device=x.device)
         else:
             k, v, k_pos = shared
+        pooled = self._pool(k, v) if self.sparse is not None else None
         out = torch.empty_like(x)
         for s, e in _spans(x.shape[1], self.chunk):
             lo = max(0, s - self.context_q)
-            out[:, s:e] = self._attend(x[:, lo:e], k, v, s, lo)
+            out[:, s:e] = self._attend(x[:, lo:e], k, v, s, lo, pooled)
         return (out, k, v, k_pos) if self.owner else (out,)
 
     def backward(self, x, extras, grads):
@@ -158,13 +199,18 @@ class AttentionHalf:
                 k.grad, v.grad = grads[1].clone(), grads[2].clone()
         else:
             k, v = extras[0].detach().requires_grad_(True), extras[1].detach().requires_grad_(True)
+        pooled = None
+        if self.sparse is not None:
+            pooled = tuple(t.requires_grad_(True) for t in self._pool(k, v))
         for s, e in reversed(_spans(x.shape[1], self.chunk)):                       # B
             lo = max(0, s - self.context_q)
             x_ext = x[:, lo:e].detach().requires_grad_(True)
             with torch.enable_grad():
-                out = self._attend(x_ext, k, v, s, lo)
+                out = self._attend(x_ext, k, v, s, lo, pooled)
             torch.autograd.backward(out, g[:, s:e])
             dx[:, lo:e] += x_ext.grad
+        if pooled is not None:
+            self._pool_backward(k, v, *pooled)
         if not self.owner:
             return dx, (k.grad, v.grad, None)
         for s, e in reversed(_spans(x.shape[1], self.chunk)):                       # C

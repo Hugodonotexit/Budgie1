@@ -1,28 +1,36 @@
 {
   "adaptive_cutoffs": [
-    16384
+    16384,
+    40000
   ],
   "adaptive_div": 2,
   "attention_sinks": true,
   "attention_types": {
-    "D1-4": {
+    "D16-64": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 4,
       "rope": true,
-      "window": 1024
+      "window": 16384
     },
-    "D16-64": {
+    "D2-4": {
+      "conv": 2,
+      "dilation": 2,
+      "kv_heads": 6,
+      "rope": true,
+      "window": 2048
+    },
+    "D32-128": {
       "conv": 4,
       "dilation": 4,
       "kv_heads": 2,
       "rope": true,
-      "window": 16384
+      "window": 32768
     },
     "D4-16": {
       "conv": 4,
       "dilation": 4,
-      "kv_heads": 4,
+      "kv_heads": 6,
       "rope": true,
       "window": 4096
     },
@@ -34,7 +42,7 @@
       "window": 65536
     },
     "G_shared": {
-      "conv": 2,
+      "conv": 4,
       "dilation": 1,
       "kv_heads": 4,
       "rope": false,
@@ -55,11 +63,12 @@
   },
   "block_pattern": [
     "S",
-    "D1-4",
     "D4-16",
-    "S",
     "D16-64",
+    "D4-16",
+    "D2-4",
     "SUM",
+    "D32-128",
     "D64-256",
     "G_shared"
   ],
@@ -77,26 +86,22 @@
     2560
   ],
   "kv_share": {
-    "8": 1,
-    "9": 2,
-    "11": 4,
-    "12": 5,
-    "13": 6,
-    "22": 15,
-    "23": 16,
-    "25": 18,
-    "26": 19,
-    "27": 20,
-    "36": 29,
-    "37": 30,
-    "39": 32,
-    "40": 33,
-    "41": 34,
-    "50": 43,
-    "51": 44,
-    "53": 46,
-    "54": 47,
-    "55": 48
+    "10": 2,
+    "13": 5,
+    "14": 6,
+    "15": 7,
+    "26": 18,
+    "29": 21,
+    "30": 22,
+    "31": 23,
+    "42": 34,
+    "45": 37,
+    "46": 38,
+    "47": 39,
+    "58": 50,
+    "61": 53,
+    "62": 54,
+    "63": 55
   },
   "lin_chunk": 128,
   "lin_conv_kernel": 4,
@@ -107,13 +112,13 @@
   ],
   "lin_head_dim": 128,
   "lin_head_gate": true,
-  "lin_heads": 64,
+  "lin_heads": 32,
   "lin_rule": "gated_delta",
   "logit_softcap": 50.0,
   "max_position_embeddings": 1048576,
   "model_type": "budgie",
   "ngram_buckets": 262144,
-  "ngram_dim": 192,
+  "ngram_dim": 128,
   "ngram_heads": 2,
   "ngram_orders": [
     2,
@@ -121,11 +126,18 @@
   ],
   "num_attention_heads": 12,
   "num_blocks": 8,
-  "num_hidden_layers": 56,
+  "num_hidden_layers": 64,
   "pad_token_id": 0,
   "qk_norm": true,
   "rms_norm_eps": 1e-05,
   "rope_theta": 500000.0,
+  "sparse_global": {
+    "compress": 64,
+    "every": 2,
+    "group": 16,
+    "local": 128,
+    "select": 16
+  },
   "tie_word_embeddings": true,
   "transformers_version": "5.15.0",
   "use_cache": true,

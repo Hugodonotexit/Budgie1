@@ -59,8 +59,11 @@ class BudgiePreTrainedModel(PreTrainedModel):
                 module.weight.fill_(1.0)  # transformers only recognises norm classes named ...RMSNorm
             elif isinstance(module, CausalConv) and not getattr(module.weight, "_is_hf_initialized", False):
                 module.reset_parameters()
-            elif isinstance(module, Attention) and module.sinks is not None and not getattr(module.sinks, "_is_hf_initialized", False):
-                module.sinks.zero_()
+            elif isinstance(module, Attention):
+                if module.sinks is not None and not getattr(module.sinks, "_is_hf_initialized", False):
+                    module.sinks.zero_()
+                if module.sparse is not None and not getattr(module.pool_score, "_is_hf_initialized", False):
+                    module.pool_score.zero_()               # mean pooling to start
             elif isinstance(module, RetentionBranch):
                 if not getattr(module.g, "_is_hf_initialized", False):
                     module.g.fill_(self.config.lin_gate_init)
@@ -96,6 +99,8 @@ class BudgieModel(BudgiePreTrainedModel):
         for j in range(config.num_hidden_layers):
             if config.kv_owner(j) is not None:
                 self._kv_last_reader[config.kv_owner(j)] = j
+        # Compressed + selected global layers (config.sparse_global) decode on the eager path only (decode.py).
+        self.has_sparse_global = any(layer.self_attn.sparse is not None for layer in self.layers)
         self.record_branch_stats = False  # set by a caller that wants per-block branch statistics
         self.branch_stats = []
         # Set by a trainer (not saved): a torch.device to run every block's retention branch on, alongside

@@ -26,16 +26,20 @@ def test_config_json_loads_and_points_at_files_in_this_repo():
 
 def test_default_layer_structure():
     cfg = BudgieConfig()
-    assert cfg.block_pattern == ["S", "D1-4", "D4-16", "S", "D16-64", "SUM", "D64-256", "G_shared"]
-    assert cfg.num_hidden_layers == 56 and cfg.has_branch and cfg.branch_pos == 5 and cfg.layer_pattern[cfg.branch_pos] == "D64-256"
+    assert cfg.block_pattern == ["S", "D4-16", "D16-64", "D4-16", "D2-4", "SUM", "D32-128", "D64-256", "G_shared"]
+    assert cfg.num_hidden_layers == 64 and cfg.has_branch and cfg.branch_pos == 5 and cfg.layer_pattern[cfg.branch_pos] == "D32-128"
     assert (cfg.hidden_size, cfg.num_attention_heads, cfg.head_dim) == (1536, 12, 128)
-    assert cfg.attention_types["S"]["kv_heads"] == 6 and cfg.lin_rule == "gated_delta" and cfg.adaptive_cutoffs == [16384]
-    assert cfg.attention_types["D16-64"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2}
+    assert cfg.attention_types["S"]["kv_heads"] == 6 and cfg.lin_rule == "gated_delta" and cfg.adaptive_cutoffs == [16384, 40000]
+    assert cfg.attention_types["D2-4"] == {"window": 2048, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 6}
+    assert cfg.attention_types["D16-64"] == {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4}
+    assert cfg.attention_types["D32-128"] == {"window": 32768, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2}
     assert cfg.attention_types["D64-256"] == {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2}
-    assert cfg.attention_types["G_shared"] == {"window": None, "dilation": 1, "conv": 2, "rope": False, "kv_heads": 4}
+    assert cfg.attention_types["G_shared"] == {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 4}
     kinds = cfg.layer_kinds
     readers = {i for i in cfg.kv_share}
-    assert {kinds[i] for i in readers} == {"D1-4", "D4-16", "D16-64", "D64-256", "G_shared"}
+    assert {kinds[i] for i in readers} == {"D16-64", "D32-128", "D64-256", "G_shared"}   # S, D2-4 and D4-16 keep their own
+    sparse = [i for i in range(cfg.num_hidden_layers) if cfg.sparse_spec(i)]
+    assert sparse == [b * 8 + 7 for b in (1, 3, 5, 7)] and all(i in readers for i in sparse)   # blocks 2, 4, 6, 8's global layers
     assert json.loads((ROOT / "config.json").read_text())["block_pattern"] == cfg.block_pattern, "config.json is stale: regenerate it"
 
 
