@@ -1,5 +1,7 @@
 """The attention layer."""
 
+import math
+
 import torch
 from torch import nn
 
@@ -31,6 +33,9 @@ class Attention(nn.Module):
         self.heads, self.head_dim, self.kv_heads = config.num_attention_heads, config.head_dim, spec["kv_heads"]
         self.n_rep = self.heads // self.kv_heads
         self.scale = self.head_dim**-0.5
+        # config.global_logit_scale: past this length a global layer's queries are scaled up by ln(p + 1) / ln(L)
+        self.logit_scale_length = None
+        self.set_global_logit_scale(getattr(config, "global_logit_scale", None))
         d = config.hidden_size
         self.q_conv = CausalConv(d, spec["conv"], layer_idx, Q_CONV)
         self.q_proj = nn.Linear(d, self.heads * self.head_dim, bias=False)
@@ -43,12 +48,29 @@ class Attention(nn.Module):
             self.v_proj = nn.Linear(d, self.kv_heads * self.head_dim, bias=False)
             self.k_norm = QKNorm(self.head_dim, config.rms_norm_eps) if config.qk_norm else None
 
-    def _queries(self, x, cos_sin, cache, token_mask):
+    def set_global_logit_scale(self, spec):
+        """spec: config.global_logit_scale ({"type": "log", "trained_length": L} or None). Only global layers use it."""
+        self.logit_scale_length = int(spec["trained_length"]) if spec and self.pattern.is_global else None
+
+    def query_positions(self, start, T, device):
+        """The absolute positions _queries needs for the logit scale, or None when no query reaches the trained
+        length (the scale is exactly 1 there, so it is skipped)."""
+        L = self.logit_scale_length
+        if L is None or start + T < L:
+            return None
+        return torch.arange(start, start + T, device=device)
+
+    def _queries(self, x, cos_sin, cache, token_mask, positions=None):
+        """positions: the queries' absolute positions [T] (a tensor, so decoding can pass its own), only read by a
+        global layer with a logit scale; None = all below the trained length."""
         B, T, _ = x.shape
         q = self.q_proj(self.q_conv(x, cache, token_mask)).view(B, T, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
         q = q.transpose(1, 2)
+        if positions is not None and self.logit_scale_length is not None:
+            factor = (torch.log1p(positions.float()) / math.log(self.logit_scale_length)).clamp_min(1.0)
+            q = (q.float() * factor[:, None]).to(q.dtype)
         return RotaryEmbedding.apply(q, *cos_sin) if self.rope else q
 
     def _own_kv(self, x, cos_sin, cache, token_mask, past):
@@ -71,7 +93,7 @@ class Attention(nn.Module):
         """Returns (output, kv): kv is (k, v, key_positions) for an owner layer, None for a reader.
         `past` is the number of tokens already cached; attention_mask the 2D padding mask or None."""
         B, T, _ = x.shape
-        q = self._queries(x, cos_sin, cache, token_mask)
+        q = self._queries(x, cos_sin, cache, token_mask, self.query_positions(past, T, x.device))
         if self.owner:
             kv = self._own_kv(x, cos_sin, cache, token_mask, past)
             k, v, k_pos = kv

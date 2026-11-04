@@ -30,6 +30,12 @@ other than `SUM` and cannot be set). `SUM` is not a layer: it marks where the re
 The names give window and reach in k tokens (`D16-64`: window 16k, reach 64k). Rotary uses `rope_theta = 5e5`, so
 its slowest dimension turns once in ~2.6M tokens, beyond any trained length.
 
+The rotary angle `position × inv_freq` is computed in fp64 and reduced mod 2π before it is cast to fp32, 65,536
+positions at a time. The rounding error of a plain fp32 product grows with the absolute position, not with the
+distance q − k: the worst dimension is off by 0.008 rad at 256k and 0.031 rad at 1M, in q and k independently.
+Reducing in fp64 makes the angles exact (to fp32 output rounding) at any position. fp16 cannot hold positions at all
+(it is exact only up to 2,048 and overflows at 65,504).
+
 A query at position *i* in a dilated layer sees *i, i−d, i−2d, …* (*window* tokens). Dilation is implemented
 by dealing the tokens into *d* interleaved sequences, each an ordinary windowed problem, so a dilated layer
 costs the same as a local one. `G` has no positional encoding, and the whole model relies on the local layers'
@@ -51,6 +57,11 @@ with the residual stream kept in fp32 (`fp32_residual`) and a final RMSNorm befo
   2–4 taps (per kind). With `causal-conv1d` installed and on CUDA the convolution uses its kernel (wrapped as a
   `torch.library` custom op so `torch.compile` does not break on it); otherwise `F.conv1d`.
 * **QK-norm**: queries and keys are RMS-normalised per head over `head_dim`, with a learned scale, before rotary.
+* **Global logit scale** (`global_logit_scale`, off by default): past a trained length L, the global layers' queries
+  are multiplied by ln(p + 1) / ln L at absolute position p (Scalable-Softmax), which sharpens a softmax over more keys
+  than training saw. It is exactly 1 below L (1.056 at 2L, 1.111 at 4L for L = 262,144), so it changes nothing inside
+  the trained length, and it is applied the same way in the ordinary forward, the chunked long-sequence path and
+  graph-replayed decoding. `BudgieModel.set_global_logit_scale` sets it on a built model.
 * **Sinks**: one learned logit per head acts as an extra softmax slot with a zero value, so a head can attend to
   "nothing". On CUDA the sink is merged with the memory-efficient kernel's own sliding-window mode; elsewhere it
   is an extra key column.
@@ -141,6 +152,8 @@ accepted.
 | `lin_half_life_range`, `lin_gate_init`, `lin_head_gate` | (1024, 262144), 0.05, true | branch decay and gating |
 | `rms_norm_eps`, `rope_theta` | 1e-5, 500000 | |
 | `max_position_embeddings` | 524288 | not enforced; rotary has no table |
+| `rope_extension` | none | `{"type": "yarn" or "linear", "factor": s, ...}` stretches the rotary positions for a longer context (`rotary.py`); stage 11 uses YaRN ×4 from 256k |
+| `global_logit_scale` | none | `{"type": "log", "trained_length": L}`: the global layers' queries × max(1, ln(p + 1) / ln L) at position p (Scalable-Softmax); exactly 1 below L |
 | `fp32_residual` | true | residual stream in fp32 |
 | `initializer_range` | 0.025 | |
 | `tie_word_embeddings` | true | the head always reuses the input tables |

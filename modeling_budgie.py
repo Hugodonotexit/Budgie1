@@ -75,7 +75,7 @@ class BudgieModel(BudgiePreTrainedModel):
     def __init__(self, config: BudgieConfig):
         super().__init__(config)
         self.embed = BudgieEmbedding(config)
-        self.rotary = RotaryEmbedding(config.head_dim, config.rope_theta)
+        self.rotary = RotaryEmbedding(config.head_dim, config.rope_theta, getattr(config, "rope_extension", None))
         self.layers = nn.ModuleList([DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # The retention branch of every block (a SUM in config.block_pattern); no module at all without one.
@@ -114,6 +114,13 @@ class BudgieModel(BudgiePreTrainedModel):
             layer.set_offload(pool, compile_halves, chunk)
         if pool is not None:
             pool.clear()
+
+    def set_global_logit_scale(self, spec):
+        """Set config.global_logit_scale on a built model ({"type": "log", "trained_length": L} or None); every
+        global layer picks it up. Saved with the config."""
+        self.config.global_logit_scale = None if spec is None else BudgieConfig(global_logit_scale=spec).global_logit_scale
+        for layer in self.layers:
+            layer.self_attn.set_global_logit_scale(self.config.global_logit_scale)
 
     def set_branch_head_mask(self, zero_first=0, mask=None):
         """Silence retention-branch heads in every block (an experiment, not saved): the first `zero_first`

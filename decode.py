@@ -155,7 +155,7 @@ class FastDecoder:
     def _attention(self, attn, i, h, cos_sin, shared, owner):
         B = h.shape[0]
         cache = self.ecache
-        q = attn._queries(h, cos_sin, cache, None)
+        q = attn._queries(h, cos_sin, cache, None, self.pos if attn.logit_scale_length is not None else None)
         if owner is None:
             xkv = attn.kv_conv(h, cache, None)
             k = attn.k_proj(xkv).view(B, 1, attn.kv_heads, attn.head_dim)

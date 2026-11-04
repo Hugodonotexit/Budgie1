@@ -147,7 +147,9 @@ trained on the thinking and tool tokens yet.
   `D128-256`, which reaches 256k; `G_shared` and `G` are global attention without positional encoding. Every layer
   is `x += attn(norm(x))` then `x += ffn(norm(x))`.
 * **Attention.** Grouped-query, with a depthwise causal convolution on Q and another on K/V, QK-norm, rotary
-  positions (not in the global layers), and a learned sink logit per head. Every second block (2nd, 4th, …) reuses the
+  positions (not in the global layers), and a learned sink logit per head. The rotary angles are computed in fp64 and
+  reduced mod 2π, so they stay exact at 1M positions. Optional for long contexts: `rope_extension` (YaRN or linear
+  position stretching) and `global_logit_scale` (a log-length query scale on the global layers past the trained length). Every second block (2nd, 4th, …) reuses the
   K/V of the block before it in its `D1-4`, `D4-16`, `D16-64`, `D64-256`, `D128-256` and `G_shared` layers
   (`kv_share`), which cuts the KV cache.
 * **FFN.** A causal convolution, then four matrices `d → 2048 → 2048 → 2048 → d`; SiLU after the first and last hidden

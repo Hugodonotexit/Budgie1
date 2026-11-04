@@ -118,7 +118,8 @@ class AttentionHalf:
     def _attend(self, x_ext, k, v, s, lo):
         attn = self.layer.self_attn
         e = lo + x_ext.shape[1]
-        q = attn._queries(self.layer.attn_norm(x_ext), self._positions(lo, e), None, None)[:, :, s - lo:]
+        q = attn._queries(self.layer.attn_norm(x_ext), self._positions(lo, e), None, None,
+                          attn.query_positions(lo, e - lo, x_ext.device))[:, :, s - lo:]
         out = attn.pattern.attend_chunk(q, k, v, s, attn.sinks, attn.scale, attn.n_rep)
         return x_ext[:, s - lo:] + attn.o_proj(out.transpose(1, 2).reshape(x_ext.shape[0], e - s, -1))
 

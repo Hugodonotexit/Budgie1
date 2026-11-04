@@ -70,6 +70,11 @@ class BudgieConfig(PretrainedConfig):
     at `logit_softcap`. `adaptive_cutoffs=[]` makes it an ordinary full softmax.
     The frequency order is a buffer of the model (`embed.rank_of`), identity until set.
 
+    `global_logit_scale` (None = off) multiplies the queries of the global (window None) layers by
+    max(1, ln(p + 1) / ln(L)) at absolute position p, {"type": "log", "trained_length": L}: a softmax over more
+    keys than training saw is sharpened back in proportion to log(keys) (Scalable-Softmax). It is exactly 1
+    for every position below L, so it changes nothing inside the trained length.
+
     Optional retention branch (see retention.py), on when `block_pattern` has a "SUM". It is a
     small fixed-decay linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives
     spread log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) that reads each block's
@@ -123,6 +128,8 @@ class BudgieConfig(PretrainedConfig):
         lin_head_stages=None,
         rms_norm_eps=1e-5,
         rope_theta=500000.0,
+        rope_extension=None,
+        global_logit_scale=None,
         max_position_embeddings=524288,
         initializer_range=0.025,
         fp32_residual=True,
@@ -219,6 +226,19 @@ class BudgieConfig(PretrainedConfig):
                                  f"({self.lin_heads}), got {given_stages}")
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
+        if rope_extension is not None:
+            rope_extension = dict(rope_extension)
+            if rope_extension.get("type") not in ("linear", "yarn") or float(rope_extension.get("factor", 0)) < 1:
+                raise ValueError(f"rope_extension needs type 'linear' or 'yarn' and factor >= 1, got {rope_extension}")
+            if rope_extension["type"] == "yarn" and not rope_extension.get("original_max_position_embeddings"):
+                raise ValueError("rope_extension type 'yarn' needs original_max_position_embeddings")
+        self.rope_extension = rope_extension
+        if global_logit_scale is not None:
+            global_logit_scale = dict(global_logit_scale)
+            if global_logit_scale.get("type") != "log" or int(global_logit_scale.get("trained_length", 0)) < 2:
+                raise ValueError(f"global_logit_scale needs type 'log' and trained_length >= 2, got {global_logit_scale}")
+            global_logit_scale["trained_length"] = int(global_logit_scale["trained_length"])
+        self.global_logit_scale = global_logit_scale
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.fp32_residual = fp32_residual
@@ -262,6 +282,9 @@ class BudgieConfig(PretrainedConfig):
         """With the retention branch off, the branch fields are left out, so an old config.json and a
         newly saved one are identical."""
         d = super().to_dict()
+        for key in ("rope_extension", "global_logit_scale"):
+            if d.get(key) is None:
+                d.pop(key, None)                    # unset: config.json stays as before the field existed
         if not self.has_branch:
             for key in LINEAR_BRANCH_KEYS:
                 d.pop(key, None)
