@@ -12,6 +12,7 @@
     cache.py         BudgieCache
     embeddings.py    AdaptiveInput, HashedNgramEmbedding, BudgieEmbedding
     head.py          AdaptiveSoftmaxHead
+    vision.py        BudgieVision (image input, when config.vision_config is set)
 
 Loads through the Auto classes -- registered below for `import budgie`, and exported with the
 checkpoint through `auto_map` for `trust_remote_code=True`:
@@ -32,7 +33,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 from .attention import Attention
 from .cache import BudgieCache
-from .configuration_budgie import BudgieConfig
+from .configuration_budgie import DEFAULT_VISION_CONFIG, IMAGE_ID_KEYS, BudgieConfig, check_vision_config
 from .convolution import CausalConv
 from .decode import try_fast_decode
 from .decoder import DecoderLayer
@@ -41,6 +42,7 @@ from .head import AdaptiveSoftmaxHead
 from .norms import QKNorm, RMSNorm
 from .retention import RetentionBranch, document_positions, to_device
 from .rotary import RotaryEmbedding
+from .vision import BudgieVision, DepthwiseConv2d, VisionAttention
 
 
 class BudgiePreTrainedModel(PreTrainedModel):
@@ -64,6 +66,11 @@ class BudgiePreTrainedModel(PreTrainedModel):
                     module.sinks.zero_()
                 if module.sparse is not None and not getattr(module.pool_score, "_is_hf_initialized", False):
                     module.pool_score.zero_()               # mean pooling to start
+            elif isinstance(module, DepthwiseConv2d) and not getattr(module.weight, "_is_hf_initialized", False):
+                module.reset_parameters()                   # 2-D vision convs start as the identity
+            elif isinstance(module, VisionAttention):
+                if module.pool_score is not None and not getattr(module.pool_score, "_is_hf_initialized", False):
+                    module.pool_score.zero_()               # compressed vision blocks start as the plain mean
             elif isinstance(module, RetentionBranch):
                 if not getattr(module.g, "_is_hf_initialized", False):
                     module.g.fill_(self.config.lin_gate_init)
@@ -88,6 +95,8 @@ class BudgieModel(BudgiePreTrainedModel):
         self.rotary = RotaryEmbedding(config.head_dim, config.rope_theta, getattr(config, "rope_extension", None))
         self.layers = nn.ModuleList([DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Image input (config.vision_config); no module at all for a text-only model.
+        self.vision = BudgieVision(config) if config.has_vision else None
         # The retention branch of every block (a SUM in config.block_pattern); no module at all without one.
         self.branches = None
         if config.has_branch:
@@ -147,6 +156,27 @@ class BudgieModel(BudgiePreTrainedModel):
             else:
                 branch.set_head_mask(mask)
 
+    def put_images(self, x, input_ids, pixel_values, pixel_attention_mask, spatial_shapes):
+        """x with the <|image|> positions of input_ids replaced, in order (batch row by row, each image row-major), by
+        the projected features of the images (BudgieProcessor's pixel_values / pixel_attention_mask / spatial_shapes).
+        Ids with no <|image|> in them (a decode step after the prompt) leave x as it is, so generate() may pass the
+        images on every step."""
+        if self.vision is None:
+            raise ValueError("pixel_values given, but this model has no vision_config (see BudgieForCausalLM.add_vision)")
+        if input_ids is None or pixel_attention_mask is None or spatial_shapes is None:
+            raise ValueError("pixel_values needs input_ids (to find the <|image|> positions), pixel_attention_mask and spatial_shapes")
+        is_image = input_ids == self.config.vision_config["image_token_id"]
+        n_slots = int(is_image.sum())
+        if n_slots == 0:
+            return x
+        s = self.config.vision_config["pixel_shuffle"]
+        need = int((spatial_shapes[:, 0] // s * (spatial_shapes[:, 1] // s)).sum())
+        if n_slots != need:
+            raise ValueError(f"input_ids have {n_slots} <|image|> tokens, but the {len(spatial_shapes)} images need {need} "
+                             f"(processing_budgie.expand_images writes them)")
+        feats = self.vision(pixel_values, pixel_attention_mask, spatial_shapes).to(x.dtype)
+        return x.masked_scatter(is_image[..., None], feats)
+
     def get_input_embeddings(self):
         return self.embed.adaptive.tok[0]
 
@@ -161,6 +191,9 @@ class BudgieModel(BudgiePreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds=None,
         use_cache=None,
+        pixel_values=None,
+        pixel_attention_mask=None,
+        spatial_shapes=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) == (inputs_embeds is None):
@@ -181,6 +214,8 @@ class BudgieModel(BudgiePreTrainedModel):
                 cache.fast_engine.release()
 
         x = self.embed(input_ids, cache) if inputs_embeds is None else inputs_embeds
+        if pixel_values is not None:
+            x = self.put_images(x, input_ids, pixel_values, pixel_attention_mask, spatial_shapes)
         T = x.shape[1]
         past = cache.get_seq_length() if cache is not None else 0
         if position_ids is None:
@@ -261,6 +296,22 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
     def get_output_embeddings(self):
         return None  # the head reuses the input tables
 
+    def add_vision(self, vision_config=None):
+        """Give a text model image input: set config.vision_config (default DEFAULT_VISION_CONFIG) and build the vision
+        tower and projector on the model's device and dtype, initialised as the rest of Budgie is (Linear weights
+        N(0, initializer_range), zero biases, unit norms). The tower is trained from scratch. Every text weight is
+        left as it is. Returns the new BudgieVision."""
+        cfg = self.config
+        if self.model.vision is not None:
+            raise ValueError("this model already has a vision tower")
+        cfg.vision_config = check_vision_config(vision_config or DEFAULT_VISION_CONFIG, cfg.vocab_size,
+                                                (cfg.pad_token_id, cfg.bos_token_id, cfg.eos_token_id))
+        ref = next(self.parameters())
+        vision = BudgieVision(cfg)
+        vision.apply(self._init_weights)
+        self.model.vision = vision.to(ref.device, ref.dtype)
+        return self.model.vision
+
     def forward(
         self,
         input_ids=None,
@@ -271,8 +322,15 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
         labels=None,
         use_cache=None,
         logits_to_keep: int | torch.Tensor = 0,
+        pixel_values=None,
+        pixel_attention_mask=None,
+        spatial_shapes=None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        if labels is not None and self.config.has_vision:
+            v = self.config.vision_config               # the image span is input, never something to predict
+            ids = torch.tensor([v[k] for k in IMAGE_ID_KEYS], device=labels.device)
+            labels = labels.masked_fill(torch.isin(labels, ids), -100)
         out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -280,6 +338,9 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            spatial_shapes=spatial_shapes,
             **kwargs,
         )
         hidden, table = out.last_hidden_state, self.model.embed.adaptive

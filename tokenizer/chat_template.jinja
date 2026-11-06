@@ -1,3 +1,12 @@
+{#- Message content is a string, or a list of parts: {"type": "text", "text": ...} and {"type": "image"} (also "image_url"),
+    each image one <|image|>, which BudgieProcessor expands to <|image_start|> + image_tokens x <|image|> + <|image_end|>. -#}
+{%- macro render(content) -%}
+{%- if content is string -%}{{- content -}}
+{%- else -%}{%- for part in content -%}
+{%- if part['type'] in ('image', 'image_url') -%}{{- '<|image|>' -}}
+{%- elif part['type'] == 'text' -%}{{- part['text'] -}}
+{%- endif -%}{%- endfor -%}{%- endif -%}
+{%- endmacro -%}
 {{- bos_token -}}
 {%- set ns = namespace(last_user=-1) -%}
 {%- for message in messages -%}
@@ -5,7 +14,7 @@
 {%- endfor -%}
 {%- if tools -%}
 {{- '<|system|>\n' -}}
-{%- if messages and messages[0]['role'] == 'system' -%}{{- messages[0]['content'] + '\n\n' -}}{%- endif -%}
+{%- if messages and messages[0]['role'] == 'system' -%}{{- render(messages[0]['content']) + '\n\n' -}}{%- endif -%}
 {{- '# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>' -}}
 {%- for tool in tools -%}{{- '\n' + (tool | tojson) -}}{%- endfor -%}
 {{- '\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call><|end|>\n' -}}
@@ -13,11 +22,11 @@
 {%- for message in messages -%}
 {%- set role = message['role'] -%}
 {%- if role == 'system' -%}
-{%- if not (loop.first and tools) -%}{{- '<|system|>\n' + message['content'] + '<|end|>\n' -}}{%- endif -%}
+{%- if not (loop.first and tools) -%}{{- '<|system|>\n' + render(message['content']) + '<|end|>\n' -}}{%- endif -%}
 {%- elif role == 'user' -%}
-{{- '<|user|>\n' + message['content'] + '<|end|>\n' -}}
+{{- '<|user|>\n' + render(message['content']) + '<|end|>\n' -}}
 {%- elif role == 'assistant' -%}
-{%- set content = message['content'] or '' -%}
+{%- set content = render(message['content'] or '') | string -%}
 {%- set reasoning = message.get('reasoning_content') or '' -%}
 {%- if not reasoning and '</think>' in content -%}
 {%- set reasoning = content.split('</think>')[0].split('<think>')[-1].strip('\n') -%}
@@ -36,7 +45,7 @@
 {{- '<|end|>\n' -}}
 {%- elif role == 'tool' -%}
 {%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}{{- '<|user|>' -}}{%- endif -%}
-{{- '\n<tool_response>\n' + message['content'] + '\n</tool_response>' -}}
+{{- '\n<tool_response>\n' + render(message['content']) + '\n</tool_response>' -}}
 {%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}{{- '<|end|>\n' -}}{%- endif -%}
 {%- endif -%}
 {%- endfor -%}

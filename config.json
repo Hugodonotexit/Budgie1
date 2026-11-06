@@ -1,6 +1,7 @@
 {
   "adaptive_cutoffs": [
     16384,
+    32768,
     40000
   ],
   "adaptive_div": 2,
@@ -9,14 +10,14 @@
     "D16-64": {
       "conv": 4,
       "dilation": 4,
-      "kv_heads": 4,
+      "kv_heads": 2,
       "rope": true,
       "window": 16384
     },
     "D2-4": {
       "conv": 2,
       "dilation": 2,
-      "kv_heads": 6,
+      "kv_heads": 4,
       "rope": true,
       "window": 2048
     },
@@ -30,14 +31,14 @@
     "D4-16": {
       "conv": 4,
       "dilation": 4,
-      "kv_heads": 6,
+      "kv_heads": 4,
       "rope": true,
       "window": 4096
     },
     "D64-256": {
       "conv": 4,
       "dilation": 4,
-      "kv_heads": 2,
+      "kv_heads": 1,
       "rope": true,
       "window": 65536
     },
@@ -51,7 +52,7 @@
     "S": {
       "conv": 2,
       "dilation": 1,
-      "kv_heads": 6,
+      "kv_heads": 4,
       "rope": true,
       "window": 2048
     }
@@ -63,10 +64,12 @@
   },
   "block_pattern": [
     "S",
+    "D2-4",
     "D4-16",
     "D16-64",
     "D4-16",
     "D2-4",
+    "S",
     "SUM",
     "D32-128",
     "D64-256",
@@ -78,30 +81,26 @@
   "ffn_hidden_layers": 3,
   "fp32_residual": true,
   "head_dim": 128,
-  "hidden_size": 1536,
+  "hidden_size": 1024,
   "initializer_range": 0.025,
   "intermediate_size": [
-    2560,
-    2560,
-    2560
+    1280,
+    1280,
+    1280
   ],
   "kv_share": {
-    "10": 2,
-    "13": 5,
-    "14": 6,
-    "15": 7,
-    "26": 18,
-    "29": 21,
-    "30": 22,
-    "31": 23,
-    "42": 34,
-    "45": 37,
-    "46": 38,
-    "47": 39,
-    "58": 50,
-    "61": 53,
-    "62": 54,
-    "63": 55
+    "17": 7,
+    "18": 8,
+    "19": 9,
+    "37": 27,
+    "38": 28,
+    "39": 29,
+    "57": 47,
+    "58": 48,
+    "59": 49,
+    "77": 67,
+    "78": 68,
+    "79": 69
   },
   "lin_chunk": 128,
   "lin_conv_kernel": 4,
@@ -118,15 +117,15 @@
   "max_position_embeddings": 1048576,
   "model_type": "budgie",
   "ngram_buckets": 262144,
-  "ngram_dim": 128,
+  "ngram_dim": 196,
   "ngram_heads": 2,
   "ngram_orders": [
     2,
     3
   ],
-  "num_attention_heads": 12,
+  "num_attention_heads": 8,
   "num_blocks": 8,
-  "num_hidden_layers": 64,
+  "num_hidden_layers": 80,
   "pad_token_id": 0,
   "qk_norm": true,
   "rms_norm_eps": 1e-05,

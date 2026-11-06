@@ -8,30 +8,105 @@ from transformers import PretrainedConfig
 # rope: rotary positions (False = none). kv_heads: key/value heads shared by the query heads.
 # 2026-11-04: 8 layers per block at hidden 1536 / 12 heads, one global layer per block (was 12 layers at 1024 / 16 heads
 # with N, D1-2, D128-256 and a second global kind G; configs saved before carry their own attention_types).
+# 2026-11-06: hidden 1472 / FFN 2432 (was 1536 / 2560) so the text model plus the default vision tower and projector
+# (DEFAULT_VISION_CONFIG) stays under 2B parameters. The 12 query heads of 128 are unchanged (q_proj is 1472 -> 1536).
 DEFAULT_ATTENTION_TYPES = {
-    "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 6},   # local, reach 2k
-    "D2-4": {"window": 2048, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 6},   # dilated local, reach 4k
-    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 6},   # dilated mid, reach 16k
-    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 64k
+    "S": {"window": 2048, "dilation": 1, "conv": 2, "rope": True, "kv_heads": 4},   # local, reach 2k
+    "D2-4": {"window": 2048, "dilation": 2, "conv": 2, "rope": True, "kv_heads": 4},   # dilated local, reach 4k
+    "D4-16": {"window": 4096, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 4},   # dilated mid, reach 16k
+    "D16-64": {"window": 16384, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated mid, reach 64k
     "D32-128": {"window": 32768, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated long, reach 128k
-    "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 2},   # dilated long, reach 256k
+    "D64-256": {"window": 65536, "dilation": 4, "conv": 4, "rope": True, "kv_heads": 1},   # dilated long, reach 256k
     "G_shared": {"window": None, "dilation": 1, "conv": 4, "rope": False, "kv_heads": 4},  # global, no positions
 }
 
 # "SUM" is not a layer: it marks where the retention branch's output is added back to the residual stream. The branch
 # reads the stream at the start of the block and, with a SUM in the pattern, exists in every block. No SUM = no branch.
 BRANCH_SUM = "SUM"
-DEFAULT_PATTERN = ("S", "D4-16", "D16-64", "D4-16", "D2-4", BRANCH_SUM, "D32-128", "D64-256", "G_shared")
+DEFAULT_PATTERN = ("S", "D2-4", "D4-16", "D16-64", "D4-16", "D2-4", "S", BRANCH_SUM, "D32-128", "D64-256", "G_shared")
 # One multiplier per n-gram hash head. The heads must differ in their multiplier, not just a seed:
 # a seed only shifts every hash by a constant, so n-grams that collide under one head would collide
 # under all of them.
 NGRAM_HASH_BASES = (1000003, 1000033, 1000037, 1000039, 1000081, 1000099, 1000117, 1000121)
-SHARED_KINDS = ("D16-64", "D32-128", "D64-256", "G_shared")
+SHARED_KINDS = ("D32-128", "D64-256", "G_shared")
 LIN_RULES = ("retention", "gated_delta")
 # Compressed + selected global attention (see sparse.py) in every `every`-th block's global layers (2: the 2nd, 4th, ...).
 DEFAULT_SPARSE_GLOBAL = {"every": 2, "compress": 64, "select": 16, "group": 16, "local": 128}
+# Image input (vision.py), off unless `vision_config` is set: Budgie's own vision transformer (`tower`, trained from
+# scratch with the language model; Budgie layers: RMSNorm, QK-norm, the deep FFN, plus 2-D rotary positions so any
+# resolution and aspect ratio works; windowed attention in most layers, compressed + selected global attention in every
+# global_every-th layer; 2-D depthwise convs on Q, K/V and the FFN, and a conv stem), a pixel shuffle that merges each `pixel_shuffle` x `pixel_shuffle` patch square
+# into one token, and an MLP projector into the residual stream. One token = 32 x 32 px (patch 16 x shuffle 2), as in
+# Qwen3-VL / Qwen3.5. The processor resizes each image, keeping its aspect ratio, to between `min_image_tokens` and
+# `max_image_tokens` tokens (a 1920 x 1080 screenshot fits at full resolution, 60 x 34 = 2040). The ids are the
+# tokenizer's <|image|> / <|image_start|> / <|image_end|> / <|image_row|> (were <reserved_15..18>, which no training
+# shard contains); <|image_row|> ends every row of image tokens, so the model sees the grid's width.
+DEFAULT_VISION_CONFIG = {
+    "tower": {"hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 8, "head_dim": 128,
+              "intermediate_size": [1024, 1024, 1024], "patch_size": 16, "num_channels": 3, "rope_theta": 10000.0,
+              "rms_norm_eps": 1e-5,
+              # attention: windowed (window x window patches) in most layers; every global_every-th layer global,
+              # full up to dense_max_patches patches, compressed (compress x compress blocks) + selected (top
+              # `select` blocks) + local window above that (vision.py)
+              "window": 16, "global_every": 4, "compress": 4, "select": 16, "dense_max_patches": 1536,
+              # convs: `conv` x `conv` depthwise 2-D convs on Q, K/V and the FFN input of every layer (0 = none), and a
+              # conv stem (stage widths before hidden_size, one per halving of patch_size; None = a Linear patch embedding)
+              "conv": 3, "stem": [64, 128, 256]},
+    "pixel_shuffle": 2,
+    "min_image_tokens": 64,
+    "max_image_tokens": 4096,
+    "image_token_id": 18,
+    "image_start_id": 19,
+    "image_end_id": 20,
+    "image_row_id": 21,
+}
+IMAGE_ID_KEYS = ("image_token_id", "image_start_id", "image_end_id", "image_row_id")
+VISION_KEYS = tuple(DEFAULT_VISION_CONFIG)
 LINEAR_BRANCH_KEYS = ("lin_rule", "lin_heads", "lin_head_dim", "lin_conv_kernel", "lin_chunk", "lin_half_life_range", "lin_gate_init", "lin_head_gate",
                       "lin_base_heads", "lin_head_stages")
+
+
+def check_vision_config(v, vocab_size, reserved_ids):
+    """A vision_config dict, validated: the keys of DEFAULT_VISION_CONFIG (and of its tower), a token budget 1 <= min <= max, and four
+    distinct image ids inside the vocabulary that are not pad / bos / eos."""
+    v = dict(v)
+    if set(v) != set(VISION_KEYS):
+        raise ValueError(f"vision_config needs exactly the keys {sorted(VISION_KEYS)}, got {sorted(v)}")
+    t = v["tower"] = dict(v["tower"])
+    if set(t) != set(DEFAULT_VISION_CONFIG["tower"]):
+        raise ValueError(f"vision_config tower needs exactly the keys {sorted(DEFAULT_VISION_CONFIG['tower'])}, got {sorted(t)}")
+    for key in ("hidden_size", "num_hidden_layers", "num_attention_heads", "head_dim", "patch_size", "num_channels",
+                "window", "global_every", "compress", "select", "dense_max_patches", "conv"):
+        t[key] = int(t[key])
+        if t[key] < (0 if key in ("dense_max_patches", "conv") else 1):
+            raise ValueError(f"vision_config tower needs {key} >= 1, got {t[key]}")
+    t["intermediate_size"] = [int(w) for w in (t["intermediate_size"] if isinstance(t["intermediate_size"], (list, tuple))
+                                               else [t["intermediate_size"]])]
+    if not t["intermediate_size"] or min(t["intermediate_size"]) < 2:
+        raise ValueError(f"vision_config tower intermediate_size must be non-empty with every width >= 2, got {t['intermediate_size']}")
+    if t["conv"] and t["conv"] % 2 == 0:
+        raise ValueError(f"vision_config tower conv must be 0 (off) or an odd kernel size, got {t['conv']}")
+    if t["stem"] is not None:
+        t["stem"] = [int(c) for c in t["stem"]]
+        patch, stages = t["patch_size"], t["patch_size"].bit_length() - 1
+        if patch < 2 or patch & (patch - 1) or len(t["stem"]) != stages - 1 or min(t["stem"], default=1) < 1:
+            raise ValueError(f"vision_config tower stem needs a power-of-2 patch_size and one width per halving but the "
+                             f"last ({stages - 1} for patch_size {patch}), got {t['stem']}")
+    if t["window"] % t["compress"]:
+        raise ValueError(f"vision_config tower window {t['window']} must be a multiple of compress {t['compress']}")
+    if t["head_dim"] % 4:
+        raise ValueError(f"vision_config tower head_dim must be a multiple of 4 (2-D rotary: two halves, each split in two), got {t['head_dim']}")
+    t["rope_theta"], t["rms_norm_eps"] = float(t["rope_theta"]), float(t["rms_norm_eps"])
+    for key in ("pixel_shuffle", "min_image_tokens", "max_image_tokens"):
+        v[key] = int(v[key])
+    if v["pixel_shuffle"] < 1 or not 1 <= v["min_image_tokens"] <= v["max_image_tokens"]:
+        raise ValueError(f"vision_config needs pixel_shuffle >= 1 and 1 <= min_image_tokens <= max_image_tokens, got {v}")
+    ids = [int(v[k]) for k in IMAGE_ID_KEYS]
+    if len(set(ids)) != len(ids) or not all(0 <= i < vocab_size for i in ids) or set(ids) & set(reserved_ids):
+        raise ValueError(f"vision_config image ids must be {len(ids)} distinct ids in the vocabulary, none of pad/bos/eos "
+                         f"{reserved_ids}, got {ids}")
+    v.update(zip(IMAGE_ID_KEYS, ids))
+    return v
 
 
 class BudgieConfig(PretrainedConfig):
@@ -84,6 +159,13 @@ class BudgieConfig(PretrainedConfig):
     At 1M tokens that is ~10k keys per query instead of ~512k. A config.json written before `sparse_global`
     existed loads with it off.
 
+    `vision_config` (None = text only) adds image input (vision.py): keys as in DEFAULT_VISION_CONFIG. An image of
+    rows x cols tokens (its own aspect ratio, 32 x 32 px per token, min_image_tokens..max_image_tokens in all) is
+    <|image_start|>, then per row cols x <|image|> and one <|image_row|>, then <|image_end|> in input_ids (see
+    processing_budgie.py); the <|image|> embeddings are replaced by the projected vision features. None of the four
+    image ids is ever predicted (their labels are ignored). A text checkpoint gains it with
+    BudgieForCausalLM.add_vision(). A config.json without the key is text only.
+
     Optional retention branch (see retention.py), on when `block_pattern` has a "SUM". It is a
     small linear-attention branch (`lin_heads` heads of `lin_head_dim`, decay half-lives spread
     log-uniformly over `lin_half_life_range`, `lin_chunk` tokens per chunk) that reads each block's
@@ -113,12 +195,12 @@ class BudgieConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size=42000,
-        hidden_size=1536,
+        hidden_size=1024,
         block_pattern=DEFAULT_PATTERN,
         num_blocks=8,
-        intermediate_size=(2560, 2560, 2560),
+        intermediate_size=(1280, 1280, 1280),
         ffn_hidden_layers=3,
-        num_attention_heads=12,
+        num_attention_heads=8,
         head_dim=128,
         attention_types=None,
         kv_share=None,
@@ -127,9 +209,9 @@ class BudgieConfig(PretrainedConfig):
         ffn_conv_kernel=4,
         ngram_orders=(2, 3),
         ngram_buckets=262144,
-        ngram_dim=128,
+        ngram_dim=196,
         ngram_heads=2,
-        adaptive_cutoffs=(16384, 40000),
+        adaptive_cutoffs=(16384, 32768, 40000),
         adaptive_div=2,
         logit_softcap=50.0,
         lin_rule="gated_delta",
@@ -147,6 +229,7 @@ class BudgieConfig(PretrainedConfig):
         rope_extension=None,
         global_logit_scale=None,
         sparse_global=DEFAULT_SPARSE_GLOBAL,
+        vision_config=None,
         max_position_embeddings=1048576,
         initializer_range=0.025,
         fp32_residual=True,
@@ -267,6 +350,7 @@ class BudgieConfig(PretrainedConfig):
             if sg["every"] < 1 or sg["compress"] < 2 or sg["select"] < 1 or sg["group"] < 1 or sg["local"] < sg["group"]:
                 raise ValueError(f"sparse_global needs every >= 1, compress >= 2, select >= 1, group >= 1 and local >= group, got {sg}")
         self.sparse_global = sparse_global
+        self.vision_config = None if vision_config is None else check_vision_config(vision_config, vocab_size, (pad_token_id, bos_token_id, eos_token_id))
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.fp32_residual = fp32_residual
@@ -314,7 +398,7 @@ class BudgieConfig(PretrainedConfig):
         """With the retention branch off, the branch fields are left out, so an old config.json and a
         newly saved one are identical."""
         d = super().to_dict()
-        for key in ("rope_extension", "global_logit_scale", "sparse_global"):
+        for key in ("rope_extension", "global_logit_scale", "sparse_global", "vision_config"):
             if d.get(key) is None:
                 d.pop(key, None)                    # unset: config.json stays as before the field existed
         if not self.has_branch:
@@ -332,6 +416,17 @@ class BudgieConfig(PretrainedConfig):
         if self.lin_head_stages:
             return list(self.lin_head_stages)
         return [self.lin_base_heads, self.lin_heads] if self.lin_base_heads not in (None, self.lin_heads) else [self.lin_heads]
+
+    @property
+    def has_vision(self):
+        return getattr(self, "vision_config", None) is not None
+
+    @property
+    def image_pixels_per_token(self):
+        """Side in pixels of the square one image token covers (patch_size * pixel_shuffle, 32); None without vision."""
+        if not self.has_vision:
+            return None
+        return self.vision_config["tower"]["patch_size"] * self.vision_config["pixel_shuffle"]
 
     @property
     def layer_pattern(self):

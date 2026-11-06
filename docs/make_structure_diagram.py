@@ -119,7 +119,7 @@ for i, kind in enumerate(pattern):
     if i:
         arrow(LX + LW / 2, row_y[i - 1] + RH, LX + LW / 2, y)
     tag = ("reach " + k(reach(kind))) if reach(kind) else "reach: all"
-    text(LX + LW + 8, y + RH / 2 + 4, tag + (" · KV*" if kind in reader_kinds else ""), 11, "normal", "start", MUTED)
+    text(LX + LW + 8, y + RH / 2 + 4, tag + (" *" if kind in reader_kinds else ""), 11, "normal", "start", MUTED)
 if branch_on:
     g_first = cfg["block_pattern"].index("SUM")   # the layer the branch's output is added in front of
     lh, lw = cfg["lin_heads"], cfg["lin_head_dim"]
@@ -133,16 +133,18 @@ if branch_on:
     plus(LX - 24, row_y[g_first] - 8)
     text(BX + 8, row_y[g_first] + 18, "gated output", 11, "normal", "start", BRANCH[1])
 ft = by_end + 12
-text(BX, ft + 6, "*KV: " + ", ".join(map(str, shared)) + f" blocks reuse the K/V of the block before them", 11.5, "normal", "start", MUTED)
+text(BX, ft + 6, "* blocks " + ", ".join(map(str, shared)) + " reuse this layer's K/V from the block before", 11.5, "normal", "start", MUTED)
 sg = cfg.get("sparse_global")
 if sg:   # config.sparse_global: the global layers of every `every`-th block are compressed + selected
     sparse_blocks = [b + 1 for b in range(blocks) if (b + 1) % sg["every"] == 0]
-    text(BX, ft + 22, "G_shared of blocks " + ", ".join(map(str, sparse_blocks)) + f": compressed ({sg['compress']}-token blocks)"
-         f" + top-{sg['select']} blocks + last {sg['local']}", 11.5, "normal", "start", MUTED)
-arrow(CX, by_end, CX, by_end + 52 + 8, head=True)  # to final norm
-box(CX - 80, by_end + 60, 160, 32, ["RMSNorm"], PLAIN, 13)
-arrow(CX, by_end + 92, CX, by_end + 120)
-hy = by_end + 120
+    text(BX, ft + 22, "G_shared of blocks " + ", ".join(map(str, sparse_blocks)) + f": compressed ({sg['compress']}-token",
+         11.5, "normal", "start", MUTED)
+    text(BX, ft + 38, f"blocks) + top-{sg['select']} blocks + the last {sg['local']} tokens", 11.5, "normal", "start", MUTED)
+arrow(CX, by_end, CX, ft - 4, head=False)          # to final norm, broken around the footnotes
+arrow(CX, ft + 46, CX, by_end + 76, head=True)
+box(CX - 80, by_end + 76, 160, 32, ["RMSNorm"], PLAIN, 13)
+arrow(CX, by_end + 108, CX, by_end + 136)
+hy = by_end + 136
 box(66, hy, 456, 66, ["Adaptive softmax head, tied to the embedding tables",
                       f"logit soft-cap {cfg['logit_softcap']:g}, loss computed in chunks"], PLAIN, 12.5)
 arrow(CX, hy + 66, CX, hy + 94)

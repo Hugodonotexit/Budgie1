@@ -12,7 +12,11 @@
 | 5 | `<\|assistant\|>` | 15 | `</tool_response>` |
 | 6 | `<\|end\|>` | 16 | `<file_sep>` |
 | | | 17 | `<repo_name>` |
-| | | 18–31 | `<reserved_15>` … `<reserved_28>` |
+| | | 18 | `<\|image\|>` |
+| | | 19 | `<\|image_start\|>` |
+| | | 20 | `<\|image_end\|>` |
+| | | 21 | `<\|image_row\|>` |
+| | | 22–31 | `<reserved_19>` … `<reserved_28>` |
 | 7 | `<fim_prefix>` | | |
 | 8 | `<fim_suffix>` | | |
 | 9 | `<fim_middle>` | | |
@@ -24,7 +28,10 @@
 * The reserved ids were renamed in place, so the vocabulary size and the embedding shape did not change.
   `<file_sep>` and `<repo_name>` (2026-11-03, before any training) mark files and the repository name in
   repository-level code, as in StarCoder2; `<fim_prefix>`, `<fim_suffix>` and `<fim_middle>` are the
-  fill-in-the-middle sentinels.
+  fill-in-the-middle sentinels. `<|image|>`, `<|image_start|>`, `<|image_end|>` and `<|image_row|>` (2026-11-06,
+  ids 18–21, never seen in any training shard) mark images: see the README's Images section. Message content may be a list of parts
+  (`{"type": "text", "text": ...}`, `{"type": "image"}`); the template writes one `<|image|>` per image and
+  `BudgieProcessor` expands it to the image's span (rows of `<|image|>`, each ended by `<|image_row|>`).
 * **Plain `tok(text)` returns `<bos> text`**, with no trailing `<eos>`: the post-processor adds `<bos>` only (for a
   pair, `tok(a, b)` is `<bos> a b`). So a prompt can be continued as it is, and benchmark harnesses that tokenize
   with special tokens on (lm-evaluation-harness with `add_bos_token=True`) give every context and continuation a

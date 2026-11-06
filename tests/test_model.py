@@ -135,10 +135,13 @@ def test_default_kv_sharing_pairs_consecutive_blocks():
     cfg = tiny_config(num_blocks=4)
     size = len(cfg.layer_pattern)
     shared = [p for p, kind in enumerate(cfg.layer_pattern) if kind in SHARED_KINDS]
-    assert shared == [4, 5]                 # D16-64, G_shared; S, D1-4 and D4-16 always compute their own
-    assert cfg.kv_owner(size + 4) == 4      # block 2's D16-64 reads block 1's
-    assert cfg.kv_owner(size + 0) is None and cfg.kv_owner(size + 3) is None
-    assert cfg.kv_owner(3 * size + 5) == 2 * size + 5  # G_shared
+    own = [p for p in range(size) if p not in shared]
+    assert shared and own                   # derived from SHARED_KINDS, so a change of the layout or kinds keeps this valid
+    for p in shared:                        # an odd block's shared layer reads the block before's, same position
+        assert cfg.kv_owner(size + p) == p and cfg.kv_owner(3 * size + p) == 2 * size + p
+        assert cfg.kv_owner(p) is None and cfg.kv_owner(2 * size + p) is None
+    for p in own:                           # every other kind always computes its own K/V
+        assert all(cfg.kv_owner(b * size + p) is None for b in range(4))
     assert sorted(cfg.kv_share) == sorted(b * size + p for b in (1, 3) for p in shared)
     assert tiny_config(num_blocks=4, kv_share={}).kv_share == {}
 

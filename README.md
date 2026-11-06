@@ -10,19 +10,22 @@ weights, training code or data. Trained models are published on Hugging Face, in
 **Budgie1.0-1B** collection of [Hugodonotexit](https://huggingface.co/Hugodonotexit). The collection does not
 exist yet; its link will be added here when it does.
 
-The default configuration (`BudgieConfig()`) is 8 blocks of 8 layers (64 layers), hidden size 1536, 12 heads of
-128 dims, **2.06 B parameters** (1.85 B with the linear branch off), vocabulary 42,000, positions up to 1M.
+The default configuration (`BudgieConfig()`) is 8 blocks of 10 layers (80 layers), hidden size 1024, 8 heads of
+128 dims, **0.97 B parameters** (0.83 B with the linear branch off), vocabulary 42,000, positions up to 1M. Image input
+(`vision_config`, [below](#images)) adds a vision tower and projector, trained from scratch: 87 M more with
+`DEFAULT_VISION_CONFIG` (tower 83 M, projector 4 M), **1.06 B** in all.
 The model is trained by growing it one block at a time, so smaller depths matter too:
 
 | `num_blocks` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---|---|---|---|---|---|---|---|
-| parameters | 0.36 B | 0.60 B | 0.84 B | 1.08 B | 1.33 B | 1.57 B | 1.82 B | 2.06 B |
+| parameters (text) | 0.24 B | 0.34 B | 0.45 B | 0.55 B | 0.66 B | 0.76 B | 0.87 B | 0.97 B |
 
 ![Budgie structure: the layer stack, one decoder layer, and the attention patterns](docs/structure.svg)
 
-> Status: the code, tokenizer and tests are working. The layout changed on 2026-11-04 (wider and shallower, one global
-> layer per block, a Gated DeltaNet branch) before the restarted training produced a checkpoint; the Budgie1.0 models
-> are not published yet. Until they are, the examples below build a randomly initialised model.
+> Status: the code, tokenizer and tests are working. The layout changed on 2026-11-04 (one global layer per block, a
+> Gated DeltaNet branch) and again on 2026-11-06 (narrower, 10 layers per block, image input), before the restarted
+> training produced a checkpoint; the Budgie1.0 models are not published yet. Until they are, the examples below build a
+> randomly initialised model.
 
 ## Install
 
@@ -139,10 +142,52 @@ reasoning, closes it with `</think>` and answers. When nothing needs working out
 `tool_calls`; see [docs/tokenizer.md](docs/tokenizer.md) for the exact format. Note that no checkpoint has been
 trained on the thinking and tool tokens yet.
 
+### Images
+
+Image input is off by default (`vision_config=None`: no extra modules or keys). `model.add_vision()` gives a text
+checkpoint Budgie's own vision transformer and a projector, both new and **trained from scratch** (no pretrained
+encoder), leaving every text weight as it is. The tower is built from Budgie's parts (RMSNorm, QK-norm, the deep FFN)
+with 2-D rotary positions, so any resolution and aspect ratio works. Most tower layers attend within 16 × 16-patch
+windows; every 4th is global, with compressed + selected attention (the 2-D form of the text model's sparse global
+layers) for large images, so a full screenshot costs ~30× less tower attention than full attention would. A conv stem
+replaces the patch embedding, and Q, K/V and the FFN of every tower layer read a 3 × 3 depthwise conv (the text
+model's convs, made 2-D), which helps a tower trained from scratch learn locality. As in Qwen3-VL / Qwen3.5, one token covers
+32 × 32 px and each image keeps its aspect ratio, between `min_image_tokens` and `max_image_tokens` tokens (64 and
+4,096; per call with `proc(..., max_image_tokens=...)`). A 1920 × 1080 screenshot stays at full resolution
+(34 rows × 60 = 2,040 tokens). In the text an image is `<|image_start|>`, then each row of `<|image|>` tokens followed
+by `<|image_row|>`, then `<|image_end|>`; the row tokens tell the model the grid's width. The `<|image|>` embeddings
+are replaced with the projected image features, and nothing in the span is ever predicted.
+
+```python
+from budgie import BudgieProcessor
+
+model.add_vision()                                   # once, on a text model; saved with the checkpoint after that
+proc = BudgieProcessor(tok, model.config)
+msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Where is the Save button?"}]}]
+text = proc.apply_chat_template(msgs, add_generation_prompt=True)          # one <|image|> per image
+inputs = proc(text, images=[PIL.Image.open("screen.png")], add_special_tokens=False)
+model.generate(**inputs, max_new_tokens=200)         # pixel_values, pixel_attention_mask, spatial_shapes
+```
+
+![Budgie image input: the vision tower, what its attention reads, and how it is trained](docs/vision.svg)
+
+**Masked patches.** `BudgieViT(pixel_values, pixel_attention_mask, spatial_shapes, keep=...)` runs only the patches
+`keep` marks (a bool per patch of every image), for masked image modelling: attention is among the kept patches only,
+the 2-D convs see the dropped ones as zeros (scattered into the full grid, convolved, gathered back) and their pixels
+are zeroed before the stem, so nothing of a dropped patch reaches a kept one. It needs images of at most
+`dense_max_patches` patches (compressed + selected attention needs the full grid). Consecutive images with the same
+number of patches go through the global layers as one batched attention call.
+
+No checkpoint has been trained with images yet. The Budgie 1 tower is pretrained alone first, as a masked
+autoencoder at 128, 256 and then 512 px (it sees 25% of the patches; a small decoder that is thrown away rebuilds the
+rest), then joins the text model: the projector alone first, then everything, on captions, page reading, screenshots,
+GUI grounding and image chat. Because the tower starts from random weights, it needs far more image data than a
+pretrained encoder would before it is useful.
+
 ## Architecture in short
 
-* **Layers.** A block is `S D4-16 D16-64 D4-16 D2-4 SUM D32-128 D64-256 G_shared`, repeated `num_blocks` times (8 by
-  default → 64 layers; `SUM` is not a layer). `S` is local attention (a 2k window); the `D` layers are dilated, named by
+* **Layers.** A block is `S D2-4 D4-16 D16-64 D4-16 D2-4 S SUM D32-128 D64-256 G_shared`, repeated `num_blocks` times
+  (8 by default → 80 layers; `SUM` is not a layer). `S` is local attention (a 2k window); the `D` layers are dilated, named by
   window and reach (`D16-64`: a 16k window at stride 4 reaching 64k back), up to `D64-256`, which reaches 256k; `G_shared` is
   global attention without positional encoding, one per block. Past 256k only the global layers and the linear branch
   see anything, which keeps long contexts cheap: at 1M tokens a global layer averages 512k keys per query and a
@@ -151,18 +196,18 @@ trained on the thinking and tool tokens yet.
   positions (not in the global layers), and a learned sink logit per head. The rotary angles are computed in fp64 and
   reduced mod 2π, so they stay exact at 1M positions. Optional for long contexts: `rope_extension` (YaRN or linear
   position stretching) and `global_logit_scale` (a log-length query scale on the global layers past the trained length). Every second block (2nd, 4th, …) reuses the
-  K/V of the block before it in its `D16-64`, `D32-128`, `D64-256` and `G_shared` layers (`kv_share`), which
-  cuts the KV cache; `S`, `D2-4` and `D4-16` keep their own.
+  K/V of the block before it in its `D32-128`, `D64-256` and `G_shared` layers (`kv_share`), which cuts the KV cache;
+  `S`, `D2-4`, `D4-16` and `D16-64` keep their own.
 * **Sparse global layers (`sparse_global`).** In every second block the global layer is compressed + selected instead
   of dense, after DeepSeek's NSA: each query sees every earlier 64-token block pooled into one key and value, the 16
   blocks that the previous 16 queries rated highest token by token, and the last 128 tokens, in one softmax. At 1M
   tokens that is ~10k keys per query instead of ~512k, and total attention cost drops to about 0.6× (0.7× at 256k);
   these layers read the dense layer's K/V before them, so the KV cache does not change. The other four global layers
   stay dense for exact lookups. Models with these layers decode on the eager path (no CUDA-graph decoding).
-* **FFN.** A causal convolution, then four matrices `d → 2560 → 2560 → 2560 → d`; SiLU after the first and last hidden
+* **FFN.** A causal convolution, then four matrices `d → 1280 → 1280 → 1280 → d`; SiLU after the first and last hidden
   layer and a centred dSiLU after the middle one.
 * **Embeddings.** A frequency-sorted adaptive embedding (the 16,384 most frequent tokens at width d, about 94% of
-  text; ranks 16,384–39,999 at d/2; the last 2,000 at d/4) plus hashed 2- and 3-gram tables with two independent hash heads each, projected up to the
+  text; ranks 16,384–32,767 at d/2, 32,768–39,999 at d/4, the last 2,000 at d/8) plus hashed 2- and 3-gram tables with two independent hash heads each, projected up to the
   hidden size. The output head is an adaptive
   softmax tied to the same tables, with logits soft-capped at 50.
 * **Linear branch (on when `block_pattern` has a `SUM`).** A Gated DeltaNet branch per block (32 heads × 128) that reads
@@ -177,14 +222,17 @@ trained on the thinking and tool tokens yet.
 ## Tests
 
 ```bash
-pytest tests                # CPU only, about 40 s
+pytest tests                # CPU only, about 5 minutes
 ```
 
 They cover shapes and log-probabilities, causality, cached decoding against a full forward pass, `generate`,
 configuration validation, `save_pretrained` → `from_pretrained` including loading in a fresh process with
 `trust_remote_code`, the tokenizer, special tokens and chat template, and the Gated DeltaNet recurrence against its
 token-by-token fp64 reference (`tests/test_gated_delta.py`), and the compressed + selected global layers against theirs
-(`tests/test_sparse.py`, including a numerical gradient check and the chunked long-sequence path). `tests/test_decode.py` checks the
+(`tests/test_sparse.py`, including a numerical gradient check and the chunked long-sequence path), and image input
+(`tests/test_vision.py`, with a tiny random tower; `tests/test_vision_masked.py` for the masked-patch path: keeping
+every patch changes nothing, kept outputs never depend on dropped pixels, windows hold only their kept patches).
+`tests/test_decode.py` checks the
 CUDA-graph decode path against the eager one and is skipped when there is no GPU.
 
 ## Repository layout
@@ -197,6 +245,7 @@ CUDA-graph decode path against the eager one and is skipped when there is no GPU
 | `feedforward.py`, `activations.py`, `convolution.py` | FFN, centred dSiLU, causal convolution |
 | `embeddings.py`, `head.py` | adaptive + n-gram input, adaptive-softmax head |
 | `retention.py` | the linear branch: Gated DeltaNet and fixed-decay retention |
+| `vision.py`, `processing_budgie.py` | image input: the vision transformer (BudgieViT), pixel shuffle, projector; `BudgieProcessor` |
 | `sparse.py` | compressed + selected global attention (`sparse_global`) |
 | `cache.py` | `BudgieCache` |
 | `decode.py` | the CUDA-graph decode path (ring-buffer state, captured single-token step) |
@@ -204,7 +253,7 @@ CUDA-graph decode path against the eager one and is skipped when there is no GPU
 | `tokenizer/` | tokenizer and chat template |
 | `config.json`, `generation_config.json` | default architecture and generation settings |
 | `tests/` | pytest suite |
-| `docs/` | architecture and tokenizer notes, and the structure diagram (`structure.svg`, drawn from `config.json` by `make_structure_diagram.py`) |
+| `docs/` | architecture and tokenizer notes, the structure diagram (`structure.svg`, drawn from `config.json` by `make_structure_diagram.py`) and the image-input diagram (`vision.svg`, drawn from `DEFAULT_VISION_CONFIG` by `make_vision_diagram.py`) |
 
 ## Licence
 
