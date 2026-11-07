@@ -125,6 +125,11 @@ Inside this repository, the tokenizer is in a subfolder: `AutoTokenizer.from_pre
   from before this change still ends every text with `<eos>`; delete the `<eos>` entries of its `post_processor`
   (`single` and `pair`) to match.
 * **Documents are separated by `<bos>`.** The linear branch resets its state at every `<bos>`.
+* **Packed documents can be kept apart.** For training on rows that pack several samples (image + caption pairs,
+  chats), pass `document_starts` (`[B, T]` bool, True at each sample's first token) to `forward`. Every sample is then
+  computed exactly as if it were alone: attention, the short convolutions and the n-gram input stop at its start, the
+  linear branch restarts there, and RoPE positions count from 0. Forwards without a cache or padding only;
+  see `documents.py` and [docs/architecture.md](docs/architecture.md#document-masking).
 
 ### Chat, thinking and tools
 
@@ -231,8 +236,8 @@ configuration validation, `save_pretrained` → `from_pretrained` including load
 token-by-token fp64 reference (`tests/test_gated_delta.py`), and the compressed + selected global layers against theirs
 (`tests/test_sparse.py`, including a numerical gradient check and the chunked long-sequence path), and image input
 (`tests/test_vision.py`, with a tiny random tower; `tests/test_vision_masked.py` for the masked-patch path: keeping
-every patch changes nothing, kept outputs never depend on dropped pixels, windows hold only their kept patches).
-`tests/test_decode.py` checks the
+every patch changes nothing, kept outputs never depend on dropped pixels, windows hold only their kept patches), and document masking (`tests/test_documents.py`: packed documents give the
+outputs and gradients of each document alone, also in long-context mode). `tests/test_decode.py` checks the
 CUDA-graph decode path against the eager one and is skipped when there is no GPU.
 
 ## Repository layout
@@ -247,6 +252,7 @@ CUDA-graph decode path against the eager one and is skipped when there is no GPU
 | `retention.py` | the linear branch: Gated DeltaNet and fixed-decay retention |
 | `vision.py`, `processing_budgie.py` | image input: the vision transformer (BudgieViT), pixel shuffle, projector; `BudgieProcessor` |
 | `sparse.py` | compressed + selected global attention (`sparse_global`) |
+| `documents.py` | document masking: packed documents computed as if alone (`document_starts`) |
 | `cache.py` | `BudgieCache` |
 | `decode.py` | the CUDA-graph decode path (ring-buffer state, captured single-token step) |
 | `norms.py`, `rotary.py`, `decoder.py` | RMSNorm / QKNorm, rotary embeddings, decoder layer |

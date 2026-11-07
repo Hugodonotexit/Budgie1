@@ -10,6 +10,7 @@ from transformers.cache_utils import Cache
 from .cache import KV_CONV, Q_CONV
 from .configuration_budgie import BudgieConfig
 from .convolution import CausalConv
+from .documents import per_document
 from .norms import QKNorm
 from .patterns import AttentionPattern
 from .rotary import RotaryEmbedding
@@ -67,24 +68,26 @@ class Attention(nn.Module):
             return None
         return torch.arange(start, start + T, device=device)
 
-    def _queries(self, x, cos_sin, cache, token_mask, positions=None):
-        """positions: the queries' absolute positions [T] (a tensor, so decoding can pass its own), only read by a
-        global layer with a logit scale; None = all below the trained length."""
+    def _queries(self, x, cos_sin, cache, token_mask, positions=None, sample_pos=None):
+        """positions: the queries' absolute positions [T] (a tensor, so decoding can pass its own), or [B, T]
+        (positions within each document), only read by a global layer with a logit scale; None = all below the
+        trained length. sample_pos: document masking (documents.py) for the conv."""
         B, T, _ = x.shape
-        q = self.q_proj(self.q_conv(x, cache, token_mask)).view(B, T, self.heads, self.head_dim)
+        q = self.q_proj(self.q_conv(x, cache, token_mask, sample_pos)).view(B, T, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
         q = q.transpose(1, 2)
         if positions is not None and self.logit_scale_length is not None:
             factor = (torch.log1p(positions.float()) / math.log(self.logit_scale_length)).clamp_min(1.0)
-            q = (q.float() * factor[:, None]).to(q.dtype)
+            factor = factor[:, None, :, None] if factor.dim() == 2 else factor[:, None]
+            q = (q.float() * factor).to(q.dtype)
         return RotaryEmbedding.apply(q, *cos_sin) if self.rope else q
 
-    def _own_kv(self, x, cos_sin, cache, token_mask, past):
+    def _own_kv(self, x, cos_sin, cache, token_mask, past, sample_pos=None):
         """Owner layers: this layer's K and V for the new tokens, merged with the cache when there
         is one, and the absolute position of every key returned."""
         B, T, _ = x.shape
-        xkv = self.kv_conv(x, cache, token_mask)
+        xkv = self.kv_conv(x, cache, token_mask, sample_pos)
         k = self.k_proj(xkv).view(B, T, self.kv_heads, self.head_dim)
         v = self.v_proj(xkv).view(B, T, self.kv_heads, self.head_dim)
         if self.k_norm is not None:
@@ -112,17 +115,41 @@ class Attention(nn.Module):
         return sparse_attention(q, k, v, kc, vc, blk_ok, p0=p0, spec=self.sparse, sinks=self.sinks, scale=self.scale,
                                 key_ok=key_ok, q_ok=q_ok, state=state)
 
-    def forward(self, x, cos_sin, cache: Cache | None, shared_kv, token_mask, attention_mask, past):
+    @torch.compiler.disable
+    def _attend_documents(self, q, k, v, sample_pos):
+        """Attention of q [B, H, T, D] over k, v [B, kv_heads, T, D] (not expanded) with each document of sample_pos
+        on its own: the documents of one length bucket go through the layer's ordinary attention together, as
+        sequences that start at position 0 (documents.per_document). Kept out of torch.compile: the documents differ
+        from batch to batch."""
+        if self.sparse is not None:
+            def attend(q, k, v):
+                return self.attend_sparse(q, k, v, 0)[0]
+        else:
+            def attend(q, k, v):
+                return self.pattern.attend(q, repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep), self.sinks, self.scale)
+        return per_document(attend, sample_pos, q, k, v)
+
+    def forward(self, x, cos_sin, cache: Cache | None, shared_kv, token_mask, attention_mask, past, sample_pos=None):
         """Returns (output, kv): kv is (k, v, key_positions) for an owner layer, None for a reader.
-        `past` is the number of tokens already cached; attention_mask the 2D padding mask or None."""
+        `past` is the number of tokens already cached; attention_mask the 2D padding mask or None.
+        sample_pos [B, T]: document masking (documents.py), every document attends within itself only."""
         B, T, _ = x.shape
-        q = self._queries(x, cos_sin, cache, token_mask, self.query_positions(past, T, x.device))
+        if sample_pos is None:
+            positions = self.query_positions(past, T, x.device)
+        else:
+            if cache is not None or attention_mask is not None:
+                raise ValueError("document masking (sample_pos) is for forwards without a cache or padding")
+            positions = sample_pos - 1 if self.logit_scale_length is not None and T >= self.logit_scale_length else None
+        q = self._queries(x, cos_sin, cache, token_mask, positions, sample_pos)
         if self.owner:
-            kv = self._own_kv(x, cos_sin, cache, token_mask, past)
+            kv = self._own_kv(x, cos_sin, cache, token_mask, past, sample_pos)
             k, v, k_pos = kv
         else:
             kv = None
             k, v, k_pos = shared_kv
+        if sample_pos is not None:
+            out = self._attend_documents(q, k, v, sample_pos)
+            return self.o_proj(out.transpose(1, 2).reshape(B, T, self.heads * self.head_dim)), kv
         if self.sparse is not None:
             if k.shape[2] != past + T:
                 raise RuntimeError(f"layer {self.layer_idx}: sparse attention needs every key, got {k.shape[2]} of {past + T}")

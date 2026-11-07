@@ -9,7 +9,8 @@ from .attention import Attention
 from .configuration_budgie import BudgieConfig
 from .feedforward import FeedForward
 from .norms import RMSNorm
-from .chunked import AttentionHalf, FFNHalf, staged
+from .chunked import AttentionHalf, DocumentAttentionHalf, FFNHalf, staged
+from .documents import segments as document_segments
 from .offload import offload_checkpoint
 
 
@@ -32,35 +33,46 @@ class DecoderLayer(GradientCheckpointingLayer):
         self._attn_fn, self._ffn_fn = self._attn_half, self._ffn_half
         self._whole_compiled = None
 
-    def forward(self, x, cos_sin, cache, shared_kv, token_mask, attention_mask, past):
+    def forward(self, x, cos_sin, cache, shared_kv, token_mask, attention_mask, past, sample_pos=None):
+        """sample_pos [B, T]: document masking (documents.py), or None."""
         if self.offload is not None and cache is None and token_mask is None and attention_mask is None and past == 0:
             if torch.is_grad_enabled():
-                return self._forward_offloaded(x, cos_sin, shared_kv)
+                return self._forward_offloaded(x, cos_sin, shared_kv, sample_pos)
             if self.chunk and x.shape[1] > self.chunk:       # evaluation of a long sequence: the chunked forward, no host copies
-                out = AttentionHalf(self, cos_sin, self.chunk).forward(x, *(() if shared_kv is None else tuple(shared_kv)))
-                return FFNHalf(self, self.chunk).forward(out[0])[0], (tuple(out[1:]) if len(out) > 1 else None)
-        a, kv = self.self_attn(self.attn_norm(x), cos_sin, cache, shared_kv, token_mask, attention_mask, past)
+                out = self._chunked_attention(cos_sin, sample_pos).forward(x, *(() if shared_kv is None else tuple(shared_kv)))
+                return FFNHalf(self, self.chunk, sample_pos).forward(out[0])[0], (tuple(out[1:]) if len(out) > 1 else None)
+        a, kv = self.self_attn(self.attn_norm(x), cos_sin, cache, shared_kv, token_mask, attention_mask, past, sample_pos)
         x = x + a
-        return x + self.ffn(self.ffn_norm(x), cache, token_mask), kv
+        return x + self.ffn(self.ffn_norm(x), cache, token_mask, sample_pos), kv
 
     # ------------------------------------------------------------------ long-sequence mode
-    def _attn_half(self, x, k=None, v=None, k_pos=None, *, cos_sin=None):
+    def _attn_half(self, x, k=None, v=None, k_pos=None, sample_pos=None, *, cos_sin=None):
         shared = None if k is None else (k, v, k_pos)
-        a, kv = self.self_attn(self.attn_norm(x), cos_sin, None, shared, None, None, 0)
+        a, kv = self.self_attn(self.attn_norm(x), cos_sin, None, shared, None, None, 0, sample_pos)
         x = x + a
         return (x,) if kv is None else (x, *kv)
 
-    def _ffn_half(self, x):
-        return x + self.ffn(self.ffn_norm(x), None, None)
+    def _ffn_half(self, x, sample_pos=None):
+        return x + self.ffn(self.ffn_norm(x), None, None, sample_pos)
 
-    def _forward_offloaded(self, x, cos_sin, shared_kv):
+    def _chunked_attention(self, cos_sin, sample_pos):
+        """The attention half a chunk at a time: of the whole rows, or of each document on its own."""
+        if sample_pos is None:
+            return AttentionHalf(self, cos_sin, self.chunk)
+        return DocumentAttentionHalf(self, cos_sin, self.chunk, document_segments(sample_pos))
+
+    def _forward_offloaded(self, x, cos_sin, shared_kv, sample_pos=None):
         extras = () if shared_kv is None else tuple(shared_kv)  # (k, v, key positions) of the owner layer
         if self.chunk and x.shape[1] > self.chunk:              # the halves a chunk at a time, forward and backward (chunked.py)
-            out = staged(AttentionHalf(self, cos_sin, self.chunk), self.offload, x, *extras)
-            return staged(FFNHalf(self, self.chunk), self.offload, out[0])[0], (tuple(out[1:]) if len(out) > 1 else None)
+            out = staged(self._chunked_attention(cos_sin, sample_pos), self.offload, x, *extras)
+            return staged(FFNHalf(self, self.chunk, sample_pos), self.offload, out[0])[0], (tuple(out[1:]) if len(out) > 1 else None)
+        if sample_pos is not None:
+            extras = (extras or (None, None, None)) + (sample_pos,)
         out = offload_checkpoint(functools.partial(self._attn_fn, cos_sin=cos_sin), self.offload, x, *extras)
         x1, kv = out[0], (tuple(out[1:]) if len(out) > 1 else None)
-        return offload_checkpoint(self._ffn_fn, self.offload, x1), kv
+        if sample_pos is None:
+            return offload_checkpoint(self._ffn_fn, self.offload, x1), kv
+        return offload_checkpoint(self._ffn_fn, self.offload, x1, sample_pos), kv
 
     def set_offload(self, pool, compile_halves=False, chunk=None):
         """pool: a HostPool to switch long-sequence mode on, None to switch it off. With `compile_halves` the

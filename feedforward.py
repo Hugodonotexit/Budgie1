@@ -21,8 +21,8 @@ class FeedForward(nn.Module):
         hidden = len(widths) - 2
         self.activations = nn.ModuleList([CenteredDSiLU() if i == hidden // 2 else nn.SiLU() for i in range(hidden)])
 
-    def forward(self, x, cache, token_mask):
-        h = self.conv(x, cache, token_mask)
+    def forward(self, x, cache, token_mask, sample_pos=None):
+        h = self.conv(x, cache, token_mask, sample_pos)
         for linear, activation in zip(self.layers[:-1], self.activations):
             h = activation(linear(h))
         return self.layers[-1](h)

@@ -389,7 +389,7 @@ class RetentionBranch(GradientCheckpointingLayer):
             self._half_life_on[device] = torch.tensor(self._half_life, dtype=torch.float32, device=device)
         return self._half_life_on[device]
 
-    def forward_on(self, device, x0, doc_pos, token_mask):
+    def forward_on(self, device, x0, doc_pos, token_mask, conv_pos=None):
         """forward() computed on another GPU, for training and eval (no cache). The input and every
         parameter are copied there first, differentiably, so the gradients land on the parameters where
         they live. The result stays on `device`: move it back with to_device only when it is needed, and
@@ -398,7 +398,8 @@ class RetentionBranch(GradientCheckpointingLayer):
         x0 = to_device(x0, device, host_wait_back=True)
         doc_pos = to_device(doc_pos, device)
         token_mask = None if token_mask is None else to_device(token_mask, device)
-        return self(x0, None, doc_pos, token_mask, weights=weights)
+        conv_pos = None if conv_pos is None else to_device(conv_pos, device)
+        return self(x0, None, doc_pos, token_mask, weights=weights, conv_pos=conv_pos)
 
     def _sub(self, name, weights, *args):
         """Submodule `name` applied to args, with its parameters taken from `weights` when given."""
@@ -407,14 +408,16 @@ class RetentionBranch(GradientCheckpointingLayer):
             return module(*args)
         return functional_call(module, {k: weights[f"{name}.{k}"] for k, _ in module.named_parameters()}, args)
 
-    def forward(self, x0, cache: Cache | None, doc_pos, token_mask, weights=None, S_init=None, drop=0, return_state=False):
-        """`weights`: parameter name -> tensor to use in its place (forward_on's copies).
+    def forward(self, x0, cache: Cache | None, doc_pos, token_mask, weights=None, S_init=None, drop=0, return_state=False,
+                conv_pos=None):
+        """`weights`: parameter name -> tensor to use in its place (forward_on's copies). `conv_pos` [B, T of x0]:
+        document masking for the conv (documents.py); the state already restarts wherever doc_pos is 1.
         `S_init`, `drop`, `return_state` are for forward_segmented: the state carried in from the previous
         segment, the number of leading tokens of x0 that only supply the conv's context (their outputs are
         discarded, and `doc_pos` covers only the tokens after them), and whether to return (out, S)."""
         B, H, dk = x0.shape[0], self.heads, self.head_dim
         gain, g = (self.gain, self.g) if weights is None else (weights["gain"], weights["g"])
-        u = self._sub("conv", weights, self._sub("norm", weights, x0), cache, token_mask)
+        u = self._sub("conv", weights, self._sub("norm", weights, x0), cache, token_mask, conv_pos)
         if drop:
             u = u[:, drop:]
         T = u.shape[1]
@@ -446,11 +449,11 @@ class RetentionBranch(GradientCheckpointingLayer):
                           "out_rms": out.detach().pow(2).mean(dim=(1, 2)).sqrt()}
         return (out, S) if return_state else out
 
-    def _segment(self, x_ext, S_in, doc_pos, *, drop):
-        out, S = self.forward(x_ext, None, doc_pos, None, S_init=S_in, drop=drop, return_state=True)
+    def _segment(self, x_ext, S_in, doc_pos, conv_pos=None, *, drop):
+        out, S = self.forward(x_ext, None, doc_pos, None, S_init=S_in, drop=drop, return_state=True, conv_pos=conv_pos)
         return out.to(x_ext.dtype), S
 
-    def forward_segmented(self, x0, doc_pos, segment, pool=None):
+    def forward_segmented(self, x0, doc_pos, segment, pool=None, conv_pos=None):
         """forward() without a cache, `segment` tokens at a time, for sequences whose whole-sequence activations
         do not fit (the branch needs ~100 MiB per 1k tokens in forward plus backward). The recurrent state is
         carried from one segment to the next, the conv gets its (width - 1) tokens of context by overlapping
@@ -464,9 +467,10 @@ class RetentionBranch(GradientCheckpointingLayer):
         for start in range(0, T, segment):
             end, lo = min(start + segment, T), max(0, start - context)
             run = functools.partial(self._segment, drop=start - lo)
+            extra = () if conv_pos is None else (conv_pos[:, lo:end],)
             if pool is not None:
-                out, S = offload_checkpoint(run, pool, x0[:, lo:end], S, doc_pos[:, start:end])
+                out, S = offload_checkpoint(run, pool, x0[:, lo:end], S, doc_pos[:, start:end], *extra)
             else:
-                out, S = run(x0[:, lo:end], S, doc_pos[:, start:end])
+                out, S = run(x0[:, lo:end], S, doc_pos[:, start:end], *extra)
             outs.append(out)
         return torch.cat(outs, 1)

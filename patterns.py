@@ -74,8 +74,8 @@ class AttentionPattern:
         """The queries at positions start .. start + Tq - 1 of a whole sequence, attending over that sequence's
         K/V: q [B, H, Tq, D]; k, v [B, kv_heads, T, D] (not expanded). Equals attend() on the whole sequence
         restricted to those queries, so a long sequence can be done a chunk at a time with only K/V at full
-        length. With dilation d, `start` and Tq must be multiples of d (and so is the end of the keys it reads,
-        which is `start + Tq`). The key slice is expanded to the query heads one K/V head at a time (n_rep query
+        length. With dilation d, `start` must be a multiple of d; a chunk that ends off a multiple of d (the last
+        one of a sequence) is padded at the end with empty queries and keys, after every real one. The key slice is expanded to the query heads one K/V head at a time (n_rep query
         heads each): all at once it is [B, H, keys, D] twice, which for a global layer at 128k is 1 GiB."""
         Tq, d = q.shape[2], self.dilation
         end = start + Tq
@@ -84,14 +84,19 @@ class AttentionPattern:
         if not window_attention_supported(q, sinks):
             return self.attend_masked(q, repeat_kv(k[:, :, lo:end], n_rep), repeat_kv(v[:, :, lo:end], n_rep),
                                       torch.arange(start, end, device=q.device), torch.arange(lo, end, device=q.device), None, sinks, scale)
-        if d > 1 and (start % d or Tq % d):
-            raise ValueError(f"a dilation-{d} chunk must start and end on a multiple of {d} (start {start}, length {Tq})")
+        if d > 1 and start % d:
+            raise ValueError(f"a dilation-{d} chunk must start on a multiple of {d} (start {start})")
+        tail = (-Tq) % d                             # future positions: no real query sees them
+        if tail:
+            q = F.pad(q, (0, 0, 0, tail))
         outs = []
         for g in range(k.shape[1]):
             heads = slice(g * n_rep, (g + 1) * n_rep)
-            outs.append(self._chunk_group(q[:, heads], repeat_kv(k[:, g:g + 1, lo:end], n_rep), repeat_kv(v[:, g:g + 1, lo:end], n_rep),
-                                          (start - lo) // d, sinks[heads], scale))
-        return torch.cat(outs, 1)
+            kc, vc = k[:, g:g + 1, lo:end], v[:, g:g + 1, lo:end]
+            if tail:
+                kc, vc = F.pad(kc, (0, 0, 0, tail)), F.pad(vc, (0, 0, 0, tail))
+            outs.append(self._chunk_group(q[:, heads], repeat_kv(kc, n_rep), repeat_kv(vc, n_rep), (start - lo) // d, sinks[heads], scale))
+        return torch.cat(outs, 1)[:, :, :Tq]
 
     def _chunk_group(self, q, kc, vc, pad, sinks, scale):
         """One group of heads of attend_chunk; kc, vc are the key slice [lo, end) already expanded to q's heads."""

@@ -255,6 +255,33 @@ with the language model (the README's [Images](../README.md#images) section). `d
   the projected features, image after image, row-major. Labels equal to any of the four image ids are ignored. A
   forward whose ids have no `<|image|>` (a decode step) ignores the image inputs, so `generate()` can pass them every step.
 
+## Document masking
+
+`forward(..., document_starts=...)` (`[B, T]` bool, True at the first token of each packed document) makes every
+document of a row compute exactly what it computes alone. `documents.positions` turns the starts into `sample_pos`,
+each token's 1-based position in its document, and every token-mixing part reads it:
+
+| Part | What it does at a document start |
+|---|---|
+| attention (every kind) | attends within the document only |
+| causal convs (Q, K/V, FFN, branch) | taps that reach back past the start read zero |
+| n-gram input | history from before the start is the pad id |
+| linear branch | its state restarts, as at `<bos>` |
+| RoPE | `position_ids` default to `sample_pos - 1`, counting from 0 |
+
+Attention is not given a mask. The documents are cut out of the rows, zero-padded at their end to a length bucket
+(`documents.bucket`: rounded up to 1/8 of the length's power of two, so at most 12.5% padding) and stacked. Each
+bucket then runs the layer's ordinary attention (`AttentionPattern.attend`, or `sparse_attention` from position 0)
+as one batch of sequences. The padding comes after every real token of its document, and nothing causal reads
+ahead, so the result is exact and no new kernel is needed. The cost is one attention call per bucket and layer. The
+call sits in a `torch.compiler.disable` method, so compiled layers break around it instead of recompiling for every
+new set of documents. In long-context mode, the chunked attention half does the same per bucket
+(`chunked.DocumentAttentionHalf`); the FFN half only needs the masked conv.
+
+Document starts are read back to the host once per forward (`documents.segments`, cached for that tensor). A call
+whose starts mark nothing after position 0 is an ordinary forward. Rows with no start after 0 are simply one
+document of length T and are batched together without a copy.
+
 ## Cache
 
 `BudgieCache` holds, per layer, the keys and values that a later query can still see (`(window − 1) · dilation`

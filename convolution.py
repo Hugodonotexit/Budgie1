@@ -93,11 +93,21 @@ class CausalConv(nn.Module):
         self.weight.zero_()
         self.weight[:, -1] = 1.0
 
-    def forward(self, x, cache: Cache | None = None, token_mask=None):
+    def forward(self, x, cache: Cache | None = None, token_mask=None, sample_pos=None):
         """x: [B, T, D]. token_mask [B, T] zeroes padded positions first, so left padding sees
-        the same zeros an unpadded sequence's start does."""
+        the same zeros an unpadded sequence's start does. sample_pos [B, T] (documents.py, no cache): a tap
+        that reaches back past the token's document start reads zero, as at the start of a sequence."""
         if token_mask is not None:
             x = x * token_mask[..., None].to(x.dtype)
+        if sample_pos is not None:
+            if cache is not None:
+                raise ValueError("document masking (sample_pos) is for forwards without a cache")
+            w = self.weight.to(x.dtype)
+            out = x * w[:, -1]
+            for back in range(1, self.width):         # x[t - back], where it is still in t's document
+                shifted = torch.nn.functional.pad(x, (0, 0, back, 0))[:, :x.shape[1]]
+                out = out + shifted * (sample_pos > back)[..., None].to(x.dtype) * w[:, -1 - back]
+            return out
         xt = x.transpose(1, 2)  # [B, D, T], a channel-last view
         T = xt.shape[-1]
         if cache is not None:

@@ -85,25 +85,29 @@ class HashedNgramEmbedding(nn.Module):
         h = (h * 0x297A2D39) & mask
         return h ^ (h >> 15)
 
-    def raw_hashes(self, ctx, n, keep, T):
+    def raw_hashes(self, ctx, n, keep, T, sample_pos=None):
         """The hash of the n-gram ending at each of the T positions, per head: [B, T, heads], in
         [0, 2^31). `ctx` is the previous `keep` token ids followed by the T current ones. Each head
         is a polynomial hash mod 2^31 - 1 with its own multiplier, then mixed (all products stay below
-        2^61, so int64 never overflows)."""
+        2^61, so int64 never overflows). sample_pos [B, T] (documents.py): history from before a token's
+        document start is the pad id."""
+        back = [ctx[:, keep - j : keep - j + T] for j in range(n)]   # current token, then one further back each time
+        if sample_pos is not None:
+            back = [b if j == 0 else torch.where(sample_pos > j, b, self.pad_id) for j, b in enumerate(back)]
         out = []
         for base in NGRAM_HASH_BASES[: self.heads]:
             h = torch.full_like(ctx[:, keep:], 7919 * n)
-            for j in range(n):  # current token, then one further back each time
-                h = (h * base + ctx[:, keep - j : keep - j + T] + 1) % 2147483647
+            for b in back:
+                h = (h * base + b + 1) % 2147483647
             out.append(self._mix(h))
         return torch.stack(out, -1)
 
-    def bucket_ids(self, ctx, n, keep, T):
+    def bucket_ids(self, ctx, n, keep, T, sample_pos=None):
         """Row indices [B, T, heads]: head k's hash taken mod the slice size and offset into slice k."""
         offsets = torch.arange(self.heads, device=ctx.device) * self.rows_per_head
-        return self.raw_hashes(ctx, n, keep, T) % self.rows_per_head + offsets
+        return self.raw_hashes(ctx, n, keep, T, sample_pos) % self.rows_per_head + offsets
 
-    def forward(self, x, ids, cache: BudgieCache | None = None):
+    def forward(self, x, ids, cache: BudgieCache | None = None, sample_pos=None):
         """Returns x plus the n-gram embeddings of `ids` [B, T]. With a cache, the previous tokens
         come from it and it is updated, so decoding one token at a time matches a full forward."""
         if not self.orders:
@@ -112,7 +116,7 @@ class HashedNgramEmbedding(nn.Module):
         hist = cache.last_ids if cache is not None and cache.last_ids is not None else ids.new_full((B, keep), self.pad_id)
         ctx = torch.cat([hist, ids], 1)  # the previous `keep` ids, then these
         for n, table, proj in zip(self.orders, self.tables, self.proj):
-            rows = look_up(table, self.bucket_ids(ctx, n, keep, T))  # [B, T, heads, dim]
+            rows = look_up(table, self.bucket_ids(ctx, n, keep, T, sample_pos))  # [B, T, heads, dim]
             x = x + proj(rows.reshape(B, T, -1))
         if cache is not None and keep:
             cache.last_ids = ctx[:, -keep:].clone()
@@ -131,8 +135,8 @@ class BudgieEmbedding(nn.Module):
     def set_vocab_order(self, order):
         self.adaptive.set_vocab_order(order)
 
-    def forward(self, ids, cache: BudgieCache | None = None):
+    def forward(self, ids, cache: BudgieCache | None = None, sample_pos=None):
         x = self.adaptive(ids)
         if self.fp32_residual:
             x = x.float()
-        return self.ngram(x, ids, cache)
+        return self.ngram(x, ids, cache, sample_pos)

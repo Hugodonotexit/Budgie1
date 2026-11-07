@@ -75,12 +75,13 @@ def _spans(T, chunk):
 
 
 class FFNHalf:
-    def __init__(self, layer, chunk):
-        self.layer, self.chunk = layer, chunk
+    def __init__(self, layer, chunk, sample_pos=None):
+        self.layer, self.chunk, self.sample_pos = layer, chunk, sample_pos
         self.context = layer.ffn.conv.width - 1
 
     def _run(self, x_ext, s, lo):
-        y = self.layer.ffn(self.layer.ffn_norm(x_ext), None, None)[:, s - lo:]
+        pos = None if self.sample_pos is None else self.sample_pos[:, lo:lo + x_ext.shape[1]]
+        y = self.layer.ffn(self.layer.ffn_norm(x_ext), None, None, pos)[:, s - lo:]
         return x_ext[:, s - lo:] + y
 
     def forward(self, x):
@@ -221,3 +222,73 @@ class AttentionHalf:
             torch.autograd.backward([kk, vv], [k.grad[:, :, s:e], v.grad[:, :, s:e]])
             dx[:, lo:e] += x_ext.grad
         return dx, ()
+
+
+class DocumentAttentionHalf:
+    """AttentionHalf with document masking (documents.py): the documents of the rows run as sequences of their own,
+    those of one length bucket stacked into a batch and zero-padded at the end (documents.stack_padded), each batch
+    through its own AttentionHalf, and the results put back in place. segments: [(row, start, end)] covering every row.
+    cos/sin are cut the same way (positions restart at every document when the model made them from document_starts)."""
+
+    def __init__(self, layer, cos_sin, chunk, segments):
+        from .documents import by_bucket
+        self.owner = layer.self_attn.owner
+        self.groups = []
+        for L, members in by_bucket(segments).items():
+            cs = tuple(_stack(t, members, L, 1, rows_of=t.shape[0] > 1) for t in cos_sin)
+            self.groups.append((L, members, AttentionHalf(layer, cs, chunk)))
+
+    def forward(self, x, *shared):
+        out = torch.empty_like(x)
+        k = v = None
+        for L, members, half in self.groups:
+            res = half.forward(_stack(x, members, L, 1), *self._shared(shared, members, L))
+            _put(out, res[0], members, 1)
+            if self.owner:
+                if k is None:
+                    k = res[1].new_empty(x.shape[0], res[1].shape[1], x.shape[1], res[1].shape[3])
+                    v = torch.empty_like(k)
+                _put(k, res[1], members, 2)
+                _put(v, res[2], members, 2)
+        if not self.owner:
+            return (out,)
+        return out, k, v, torch.arange(x.shape[1], device=x.device)
+
+    @staticmethod
+    def _shared(shared, members, L):
+        if not shared:
+            return ()
+        k, v = _stack(shared[0], members, L, 2), _stack(shared[1], members, L, 2)
+        return k, v, torch.arange(L, device=k.device)
+
+    def backward(self, x, extras, grads):
+        dx = torch.zeros_like(x)
+        dk = dv = None
+        for L, members, half in self.groups:
+            seg = (_stack(grads[0], members, L, 1),)
+            if self.owner:
+                seg += tuple(None if g is None else _stack(g, members, L, 2) for g in grads[1:3])
+            d, dext = half.backward(_stack(x, members, L, 1), self._shared(extras, members, L), seg)
+            _put(dx, d, members, 1)
+            if not self.owner:
+                if dk is None:
+                    dk, dv = torch.zeros_like(extras[0]), torch.zeros_like(extras[1])
+                _put(dk, dext[0], members, 2)
+                _put(dv, dext[1], members, 2)
+        if not self.owner:
+            return dx, (dk, dv, None)
+        return dx, ()
+
+
+def _stack(t, members, L, dim, rows_of=True):
+    """documents.stack_padded of t (T at `dim`); rows_of False: t has one row that every member shares (cos/sin)."""
+    from .documents import stack_padded
+    if not rows_of:
+        members = [(0, s, e) for _, s, e in members]
+    return stack_padded(t, members, L, dim)
+
+
+def _put(dst, src, members, dim):
+    """Write each member's first (end - start) positions of src [n, ..., L, ...] into dst at its place."""
+    for i, (b, s, e) in enumerate(members):
+        dst[b].narrow(dim - 1, s, e - s).copy_(src[i].narrow(dim - 1, 0, e - s))

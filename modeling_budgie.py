@@ -37,6 +37,7 @@ from .configuration_budgie import DEFAULT_VISION_CONFIG, IMAGE_ID_KEYS, BudgieCo
 from .convolution import CausalConv
 from .decode import try_fast_decode
 from .decoder import DecoderLayer
+from .documents import has_boundaries, positions as document_sample_positions, segments as document_segments
 from .embeddings import BudgieEmbedding
 from .head import AdaptiveSoftmaxHead
 from .norms import QKNorm, RMSNorm
@@ -194,11 +195,20 @@ class BudgieModel(BudgiePreTrainedModel):
         pixel_values=None,
         pixel_attention_mask=None,
         spatial_shapes=None,
+        document_starts=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        """document_starts [B, T] bool: document masking (documents.py), True at the first token of each packed
+        document; every document is then computed as if it were alone. Forwards without a cache or padding."""
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         cfg = self.config
+        if not has_boundaries(document_starts):
+            document_starts = None
+        elif use_cache:
+            raise ValueError("document_starts is for forwards without a cache (use_cache=False)")
+        else:
+            use_cache = False
         use_cache = cfg.use_cache if use_cache is None else use_cache
         if use_cache and not isinstance(past_key_values, BudgieCache):
             if past_key_values is not None and past_key_values.get_seq_length() > 0:
@@ -213,13 +223,24 @@ class BudgieModel(BudgiePreTrainedModel):
             if cache.fast_engine is not None:  # an ordinary call after fast decoding: take the state back
                 cache.fast_engine.release()
 
-        x = self.embed(input_ids, cache) if inputs_embeds is None else inputs_embeds
+        sample_pos = None
+        if document_starts is not None:
+            if past_key_values is not None and past_key_values.get_seq_length() > 0:
+                raise ValueError("document_starts is for forwards without a cache")
+            if attention_mask is not None and not bool(attention_mask.all()):
+                raise ValueError("document_starts with padding (attention_mask) is not supported: give padding no loss instead")
+            ref = input_ids if input_ids is not None else inputs_embeds
+            if tuple(document_starts.shape) != tuple(ref.shape[:2]):
+                raise ValueError(f"document_starts {tuple(document_starts.shape)} does not match the input {tuple(ref.shape[:2])}")
+            sample_pos = document_sample_positions(document_starts.to(ref.device))
+            document_segments(sample_pos)          # the documents' boundaries, read back once for every layer
+        x = self.embed(input_ids, cache, sample_pos) if inputs_embeds is None else inputs_embeds
         if pixel_values is not None:
             x = self.put_images(x, input_ids, pixel_values, pixel_attention_mask, spatial_shapes)
         T = x.shape[1]
         past = cache.get_seq_length() if cache is not None else 0
         if position_ids is None:
-            position_ids = (torch.arange(T, device=x.device) + past)[None]
+            position_ids = sample_pos - 1 if sample_pos is not None else (torch.arange(T, device=x.device) + past)[None]
         if attention_mask is not None and (attention_mask.dim() != 2 or bool(attention_mask.all())):
             attention_mask = None  # nothing is padded
         token_mask = attention_mask[:, -T:] if attention_mask is not None else None
@@ -231,6 +252,8 @@ class BudgieModel(BudgiePreTrainedModel):
             # sequence). Computed once here; with `inputs_embeds` there are no ids, so the whole
             # sequence is one document.
             is_bos = (input_ids == cfg.bos_token_id) if input_ids is not None else torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
+            if document_starts is not None:
+                is_bos = is_bos | document_starts.to(is_bos.device).bool()
             doc_pos = document_positions(is_bos, cache.last_doc_pos if cache is not None else None, token_mask)
             self.branch_stats = []
             block_size = len(cfg.layer_pattern)
@@ -239,6 +262,7 @@ class BudgieModel(BudgiePreTrainedModel):
             if remote is not None:
                 doc_pos_remote = to_device(doc_pos, remote)
                 mask_remote = None if token_mask is None else to_device(token_mask, remote)
+                conv_pos_remote = None if sample_pos is None else to_device(sample_pos, remote)
 
         shared = {}  # K/V of the owner layers, for the layers that read them
         for i, layer in enumerate(self.layers):
@@ -249,13 +273,13 @@ class BudgieModel(BudgiePreTrainedModel):
                     block_input = x
                     branch.record_stats = self.record_branch_stats
                     if remote is not None:  # queued now, so the other GPU works through it during the local layers
-                        pending = branch.forward_on(remote, block_input, doc_pos_remote, mask_remote)
+                        pending = branch.forward_on(remote, block_input, doc_pos_remote, mask_remote, conv_pos_remote)
                 if pos == self._sum_pos:  # the branch reads the stream from the start of the block and is summed in at the SUM
                     if segmented and token_mask is None:
                         pool = self.offload_pool if torch.is_grad_enabled() else None
-                        out = branch.forward_segmented(block_input, doc_pos, self.branch_segment, pool).to(x.dtype)
+                        out = branch.forward_segmented(block_input, doc_pos, self.branch_segment, pool, sample_pos).to(x.dtype)
                     elif remote is None:
-                        out = branch(block_input, cache, doc_pos, token_mask).to(x.dtype)
+                        out = branch(block_input, cache, doc_pos, token_mask, conv_pos=sample_pos).to(x.dtype)
                     else:
                         out, pending = to_device(pending.to(x.dtype), x.device), None
                     if self.record_branch_stats:
@@ -264,7 +288,7 @@ class BudgieModel(BudgiePreTrainedModel):
                         self.branch_stats.append({**stats, "local_rms": local.pow(2).mean(dim=(1, 2)).sqrt(), "mean_abs_g": branch.g.detach().float().abs().mean()})
                     x = x + out
             owner = cfg.kv_owner(i)
-            x, kv = layer(x, cos_sin, cache, shared[owner] if owner is not None else None, token_mask, attention_mask, past)
+            x, kv = layer(x, cos_sin, cache, shared[owner] if owner is not None else None, token_mask, attention_mask, past, sample_pos)
             if owner is None and i in self._kv_last_reader:   # not every owner is read; its K/V must not outlive the layer then
                 shared[i] = kv
             elif owner is not None and self._kv_last_reader[owner] == i:
@@ -325,6 +349,7 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
         pixel_values=None,
         pixel_attention_mask=None,
         spatial_shapes=None,
+        document_starts=None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         if labels is not None and self.config.has_vision:
@@ -341,6 +366,7 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
             pixel_values=pixel_values,
             pixel_attention_mask=pixel_attention_mask,
             spatial_shapes=spatial_shapes,
+            document_starts=document_starts,
             **kwargs,
         )
         hidden, table = out.last_hidden_state, self.model.embed.adaptive
